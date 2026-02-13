@@ -176,7 +176,7 @@ CLASSES_CN = [
     '扩张型心肌病',
     '肥厚型心肌病',
     '心肌炎',
-    '心肌淀粉样变'
+    '心肌淀粉样变',
     '心肌梗死',
     '高血压心脏病',
     '正常',
@@ -4924,6 +4924,7 @@ class UniDatasets_tsvlge(Dataset):
         self.args = args
         self.mode = mode
         self.Multi_center = Multi_center
+        self.CLASSES_CN = CLASSES_CN
         print()
         if Multi_center == 'KM':
             with open(args.all_data_path, 'r') as file:
@@ -5264,13 +5265,25 @@ class UniDatasets_tsvlge(Dataset):
                 clinical_infor = ''
                 if self.Multi_center in ['KM','CD','SCS']:
                     clinical_infor = '临床信息: '
-                    B = self.G_columns_as_lists['性别'][self.data_list[idx]['Text']['excel_id']]
-                    clinical_infor += '性别: ' + str(B)
-                    C = self.G_columns_as_lists['年龄'][self.data_list[idx]['Text']['excel_id']]
-                    clinical_infor += ' | '+ '年龄: ' + str(C)
+                    excel_id = self.data_list[idx]['Text']['excel_id']
+                    def _safe_get(key):
+                        col = self.G_columns_as_lists.get(key)
+                        if col is None:
+                            return None
+                        try:
+                            return col[excel_id]
+                        except Exception:
+                            return None
+                    B = _safe_get('性别')
+                    if B is not None:
+                        clinical_infor += '性别: ' + str(B)
+                    C = _safe_get('年龄')
+                    if C is not None:
+                        clinical_infor += ' | '+ '年龄: ' + str(C)
                     if self.Multi_center == 'KM':
-                        A = self.G_columns_as_lists['临床诊断C'][self.data_list[idx]['Text']['excel_id']]
-                        clinical_infor += ' | '+ '临床信息: '+str(A)
+                        A = _safe_get('临床诊断C')
+                        if A is not None:
+                            clinical_infor += ' | '+ '临床信息: '+str(A)
                     clinical_infor += '\n'
 
 
@@ -5279,20 +5292,28 @@ class UniDatasets_tsvlge(Dataset):
                         vision_tokens, vision_patch_indices, input_texts, self.tokenizer, clinical_infor)
                     class_label = 'None'
                 elif self.prompt_mode == 'report':
-                    input_texts_org =  self.G_columns_as_lists['Trans_3'][self.data_list[idx]['Text']['excel_id']]
-                    input_texts_json = json.loads(input_texts_org)
-                    input_texts_4CH = "，".join(input_texts_json["1.心脏结构"])
-                    cardiac_function = input_texts_json.get("2.心脏运动及功能") or input_texts_json.get("2.心脏功能")
-                    input_texts_SAX = "，".join(cardiac_function)
-                    input_texts_LGE = "，".join(input_texts_json["3.延迟强化LGE"])
-                    input_texts_other = "，".join(input_texts_json["4.其他影像所见"])
-                    input_texts = ''
-                    if 'FCH' in self.dataset_name:
-                        input_texts += ('心脏结构: ' + input_texts_4CH)
-                    if 'SAX' in self.dataset_name:
-                        input_texts += ('心脏运动及功能: ' + input_texts_SAX)
-                    if 'LGE' in self.dataset_name:
-                        input_texts += ('延迟强化LGE: ' + input_texts_LGE)
+                    excel_id = self.data_list[idx]['Text']['excel_id']
+                    input_texts_org = None
+                    col = self.G_columns_as_lists.get('Trans_3')
+                    if col is not None:
+                        try:
+                            input_texts_org = col[excel_id]
+                        except Exception:
+                            input_texts_org = None
+                    if input_texts_org is not None:
+                        input_texts_json = json.loads(input_texts_org)
+                        input_texts_4CH = "，".join(input_texts_json["1.心脏结构"])
+                        cardiac_function = input_texts_json.get("2.心脏运动及功能") or input_texts_json.get("2.心脏功能")
+                        input_texts_SAX = "，".join(cardiac_function)
+                        input_texts_LGE = "，".join(input_texts_json["3.延迟强化LGE"])
+                        input_texts_other = "，".join(input_texts_json["4.其他影像所见"])
+                        input_texts = ''
+                        if 'FCH' in self.dataset_name:
+                            input_texts += ('心脏结构: ' + input_texts_4CH)
+                        if 'SAX' in self.dataset_name:
+                            input_texts += ('心脏运动及功能: ' + input_texts_SAX)
+                        if 'LGE' in self.dataset_name:
+                            input_texts += ('延迟强化LGE: ' + input_texts_LGE)
 
                     tokens, attention_masks, patch_indices, labels, answer, question = self.prepare_inputs_img_text(
                         vision_tokens, vision_patch_indices, input_texts, self.tokenizer, clinical_infor)
@@ -5780,13 +5801,25 @@ class UniDatasets_tsvlge_ALL(Dataset):
                 clinical_infor = ''
                 if self.Multi_center in ['KM','CD','SCS']:
                     clinical_infor = '临床信息: '
-                    B = self.G_columns_as_lists['性别'][self.data_list[idx]['Text']['excel_id']]
-                    clinical_infor += '性别: ' + str(B)
-                    C = self.G_columns_as_lists['年龄'][self.data_list[idx]['Text']['excel_id']]
-                    clinical_infor += ' | '+ '年龄: ' + str(C)
+                    excel_id = self.data_list[idx]['Text']['excel_id']
+                    def _safe_get(key):
+                        col = self.G_columns_as_lists.get(key)
+                        if col is None:
+                            return None
+                        try:
+                            return col[excel_id]
+                        except Exception:
+                            return None
+                    B = _safe_get('性别')
+                    if B is not None:
+                        clinical_infor += '性别: ' + str(B)
+                    C = _safe_get('年龄')
+                    if C is not None:
+                        clinical_infor += ' | '+ '年龄: ' + str(C)
                     if self.Multi_center == 'KM':
-                        A = self.G_columns_as_lists['临床诊断C'][self.data_list[idx]['Text']['excel_id']]
-                        clinical_infor += ' | '+ '临床信息: '+str(A)
+                        A = _safe_get('临床诊断C')
+                        if A is not None:
+                            clinical_infor += ' | '+ '临床信息: '+str(A)
                     clinical_infor += '\n'
 
 
@@ -5795,20 +5828,28 @@ class UniDatasets_tsvlge_ALL(Dataset):
                         vision_tokens, vision_patch_indices, input_texts, self.tokenizer, clinical_infor)
                     class_label = 'None'
                 elif self.prompt_mode == 'report':
-                    input_texts_org =  self.G_columns_as_lists['Trans_3'][self.data_list[idx]['Text']['excel_id']]
-                    input_texts_json = json.loads(input_texts_org)
-                    input_texts_4CH = "，".join(input_texts_json["1.心脏结构"])
-                    cardiac_function = input_texts_json.get("2.心脏运动及功能") or input_texts_json.get("2.心脏功能")
-                    input_texts_SAX = "，".join(cardiac_function)
-                    input_texts_LGE = "，".join(input_texts_json["3.延迟强化LGE"])
-                    input_texts_other = "，".join(input_texts_json["4.其他影像所见"])
-                    input_texts = ''
-                    if 'FCH' in self.dataset_name:
-                        input_texts += ('心脏结构: ' + input_texts_4CH)
-                    if 'SAX' in self.dataset_name:
-                        input_texts += ('心脏运动及功能: ' + input_texts_SAX)
-                    if 'LGE' in self.dataset_name:
-                        input_texts += ('延迟强化LGE: ' + input_texts_LGE)
+                    excel_id = self.data_list[idx]['Text']['excel_id']
+                    input_texts_org = None
+                    col = self.G_columns_as_lists.get('Trans_3')
+                    if col is not None:
+                        try:
+                            input_texts_org = col[excel_id]
+                        except Exception:
+                            input_texts_org = None
+                    if input_texts_org is not None:
+                        input_texts_json = json.loads(input_texts_org)
+                        input_texts_4CH = "，".join(input_texts_json["1.心脏结构"])
+                        cardiac_function = input_texts_json.get("2.心脏运动及功能") or input_texts_json.get("2.心脏功能")
+                        input_texts_SAX = "，".join(cardiac_function)
+                        input_texts_LGE = "，".join(input_texts_json["3.延迟强化LGE"])
+                        input_texts_other = "，".join(input_texts_json["4.其他影像所见"])
+                        input_texts = ''
+                        if 'FCH' in self.dataset_name:
+                            input_texts += ('心脏结构: ' + input_texts_4CH)
+                        if 'SAX' in self.dataset_name:
+                            input_texts += ('心脏运动及功能: ' + input_texts_SAX)
+                        if 'LGE' in self.dataset_name:
+                            input_texts += ('延迟强化LGE: ' + input_texts_LGE)
 
                     tokens, attention_masks, patch_indices, labels, answer, question = self.prepare_inputs_img_text(
                         vision_tokens, vision_patch_indices, input_texts, self.tokenizer, clinical_infor)
@@ -6427,13 +6468,25 @@ class UniDatasets_tsvlge_ALL2(Dataset):
                 clinical_infor = ''
                 if self.Multi_center in ['KM','CD','SCS']:
                     clinical_infor = '临床信息: '
-                    B = self.G_columns_as_lists['性别'][self.data_list[idx]['Text']['excel_id']]
-                    clinical_infor += '性别: ' + str(B)
-                    C = self.G_columns_as_lists['年龄'][self.data_list[idx]['Text']['excel_id']]
-                    clinical_infor += ' | '+ '年龄: ' + str(C)
+                    excel_id = self.data_list[idx]['Text']['excel_id']
+                    def _safe_get(key):
+                        col = self.G_columns_as_lists.get(key)
+                        if col is None:
+                            return None
+                        try:
+                            return col[excel_id]
+                        except Exception:
+                            return None
+                    B = _safe_get('性别')
+                    if B is not None:
+                        clinical_infor += '性别: ' + str(B)
+                    C = _safe_get('年龄')
+                    if C is not None:
+                        clinical_infor += ' | '+ '年龄: ' + str(C)
                     if self.Multi_center == 'KM' and self.prompt_mode != 'caption':
-                        A = self.G_columns_as_lists['临床诊断C'][self.data_list[idx]['Text']['excel_id']]
-                        clinical_infor += ' | '+ '临床信息: '+str(A)
+                        A = _safe_get('临床诊断C')
+                        if A is not None:
+                            clinical_infor += ' | '+ '临床信息: '+str(A)
                     clinical_infor += '\n'
 
 
@@ -6442,20 +6495,28 @@ class UniDatasets_tsvlge_ALL2(Dataset):
                         vision_tokens, vision_patch_indices, input_texts, self.tokenizer, clinical_infor)
                     class_label = 'None'
                 elif self.prompt_mode == 'report':
-                    input_texts_org =  self.G_columns_as_lists['Trans_3'][self.data_list[idx]['Text']['excel_id']]
-                    input_texts_json = json.loads(input_texts_org)
-                    input_texts_4CH = "，".join(input_texts_json["1.心脏结构"])
-                    cardiac_function = input_texts_json.get("2.心脏运动及功能") or input_texts_json.get("2.心脏功能")
-                    input_texts_SAX = "，".join(cardiac_function)
-                    input_texts_LGE = "，".join(input_texts_json["3.延迟强化LGE"])
-                    input_texts_other = "，".join(input_texts_json["4.其他影像所见"])
-                    input_texts = ''
-                    if 'FCH' in self.dataset_name:
-                        input_texts += ('心脏结构: ' + input_texts_4CH)
-                    if 'SAX' in self.dataset_name:
-                        input_texts += ('心脏运动及功能: ' + input_texts_SAX)
-                    if 'LGE' in self.dataset_name:
-                        input_texts += ('延迟强化LGE: ' + input_texts_LGE)
+                    excel_id = self.data_list[idx]['Text']['excel_id']
+                    input_texts_org = None
+                    col = self.G_columns_as_lists.get('Trans_3')
+                    if col is not None:
+                        try:
+                            input_texts_org = col[excel_id]
+                        except Exception:
+                            input_texts_org = None
+                    if input_texts_org is not None:
+                        input_texts_json = json.loads(input_texts_org)
+                        input_texts_4CH = "，".join(input_texts_json["1.心脏结构"])
+                        cardiac_function = input_texts_json.get("2.心脏运动及功能") or input_texts_json.get("2.心脏功能")
+                        input_texts_SAX = "，".join(cardiac_function)
+                        input_texts_LGE = "，".join(input_texts_json["3.延迟强化LGE"])
+                        input_texts_other = "，".join(input_texts_json["4.其他影像所见"])
+                        input_texts = ''
+                        if 'FCH' in self.dataset_name:
+                            input_texts += ('心脏结构: ' + input_texts_4CH)
+                        if 'SAX' in self.dataset_name:
+                            input_texts += ('心脏运动及功能: ' + input_texts_SAX)
+                        if 'LGE' in self.dataset_name:
+                            input_texts += ('延迟强化LGE: ' + input_texts_LGE)
 
                     tokens, attention_masks, patch_indices, labels, answer, question = self.prepare_inputs_img_text(
                         vision_tokens, vision_patch_indices, input_texts, self.tokenizer, clinical_infor)
@@ -6987,13 +7048,25 @@ class UniDatasets_tsvlge_ALL3(Dataset):
                 clinical_infor = ''
                 if self.Multi_center in ['KM','CD','SCS','YA']:
                     clinical_infor = '临床信息: '
-                    B = self.G_columns_as_lists['性别'][self.data_list[idx]['Text']['excel_id']]
-                    clinical_infor += '性别: ' + str(B)
-                    C = self.G_columns_as_lists['年龄'][self.data_list[idx]['Text']['excel_id']]
-                    clinical_infor += ' | '+ '年龄: ' + str(C)
+                    excel_id = self.data_list[idx]['Text']['excel_id']
+                    def _safe_get(key):
+                        col = self.G_columns_as_lists.get(key)
+                        if col is None:
+                            return None
+                        try:
+                            return col[excel_id]
+                        except Exception:
+                            return None
+                    B = _safe_get('性别')
+                    if B is not None:
+                        clinical_infor += '性别: ' + str(B)
+                    C = _safe_get('年龄')
+                    if C is not None:
+                        clinical_infor += ' | '+ '年龄: ' + str(C)
                     if self.Multi_center == 'KM':
-                        A = self.G_columns_as_lists['临床诊断C'][self.data_list[idx]['Text']['excel_id']]
-                        clinical_infor += ' | '+ '临床信息: '+str(A)
+                        A = _safe_get('临床诊断C')
+                        if A is not None:
+                            clinical_infor += ' | '+ '临床信息: '+str(A)
                     clinical_infor += '\n'
 
 
@@ -7002,20 +7075,28 @@ class UniDatasets_tsvlge_ALL3(Dataset):
                         vision_tokens, vision_patch_indices, input_texts, self.tokenizer, clinical_infor)
                     class_label = 'None'
                 elif self.prompt_mode == 'report':
-                    input_texts_org =  self.G_columns_as_lists['Trans_3'][self.data_list[idx]['Text']['excel_id']]
-                    input_texts_json = json.loads(input_texts_org)
-                    input_texts_4CH = "，".join(input_texts_json["1.心脏结构"])
-                    cardiac_function = input_texts_json.get("2.心脏运动及功能") or input_texts_json.get("2.心脏功能")
-                    input_texts_SAX = "，".join(cardiac_function)
-                    input_texts_LGE = "，".join(input_texts_json["3.延迟强化LGE"])
-                    input_texts_other = "，".join(input_texts_json["4.其他影像所见"])
-                    input_texts = ''
-                    if 'FCH' in self.dataset_name:
-                        input_texts += ('心脏结构: ' + input_texts_4CH)
-                    if 'SAX' in self.dataset_name:
-                        input_texts += ('心脏运动及功能: ' + input_texts_SAX)
-                    if 'LGE' in self.dataset_name:
-                        input_texts += ('延迟强化LGE: ' + input_texts_LGE)
+                    excel_id = self.data_list[idx]['Text']['excel_id']
+                    input_texts_org = None
+                    col = self.G_columns_as_lists.get('Trans_3')
+                    if col is not None:
+                        try:
+                            input_texts_org = col[excel_id]
+                        except Exception:
+                            input_texts_org = None
+                    if input_texts_org is not None:
+                        input_texts_json = json.loads(input_texts_org)
+                        input_texts_4CH = "，".join(input_texts_json["1.心脏结构"])
+                        cardiac_function = input_texts_json.get("2.心脏运动及功能") or input_texts_json.get("2.心脏功能")
+                        input_texts_SAX = "，".join(cardiac_function)
+                        input_texts_LGE = "，".join(input_texts_json["3.延迟强化LGE"])
+                        input_texts_other = "，".join(input_texts_json["4.其他影像所见"])
+                        input_texts = ''
+                        if 'FCH' in self.dataset_name:
+                            input_texts += ('心脏结构: ' + input_texts_4CH)
+                        if 'SAX' in self.dataset_name:
+                            input_texts += ('心脏运动及功能: ' + input_texts_SAX)
+                        if 'LGE' in self.dataset_name:
+                            input_texts += ('延迟强化LGE: ' + input_texts_LGE)
 
                     tokens, attention_masks, patch_indices, labels, answer, question = self.prepare_inputs_img_text(
                         vision_tokens, vision_patch_indices, input_texts, self.tokenizer, clinical_infor)

@@ -38,6 +38,7 @@ from transformers.modeling_attn_mask_utils import (
     _prepare_4d_causal_attention_mask_for_sdpa,
 )
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, SequenceClassifierOutputWithPast
+from transformers.generation.utils import GenerationMixin
 from transformers.modeling_utils import PreTrainedModel
 from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS, is_torch_greater_or_equal_than_1_13
 from transformers.utils import (
@@ -1063,7 +1064,10 @@ class MiniCPMAttention(nn.Module):
                     "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
                     "with a layer index."
                 )
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            if hasattr(past_key_value, "get_usable_length"):
+                kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            else:
+                kv_seq_len += past_key_value.get_seq_length(self.layer_idx)
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
 
         q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, position_ids)
@@ -1189,7 +1193,10 @@ class MiniCPMFlashAttention2(MiniCPMAttention):
 
         kv_seq_len = value_states.shape[-2]
         if past_key_value is not None:
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            if hasattr(past_key_value, "get_usable_length"):
+                kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            else:
+                kv_seq_len += past_key_value.get_seq_length(self.layer_idx)
 
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, position_ids)
@@ -1421,7 +1428,10 @@ class MiniCPMSdpaAttention(MiniCPMAttention):
                     "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
                     "with a layer index."
                 )
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            if hasattr(past_key_value, "get_usable_length"):
+                kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            else:
+                kv_seq_len += past_key_value.get_seq_length(self.layer_idx)
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
 
         q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, position_ids)
@@ -1573,7 +1583,7 @@ MINICPM_START_DOCSTRING = r"""
     "The bare MiniCPM Model outputting raw hidden-states without any specific head on top.",
     MINICPM_START_DOCSTRING,
 )
-class MiniCPM3PreTrainedModel(PreTrainedModel):
+class MiniCPM3PreTrainedModel(PreTrainedModel, GenerationMixin):
     config_class = MiniCPM3Config
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
@@ -1886,7 +1896,10 @@ class MiniCPM3Model(MiniCPM3PreTrainedModel):
             use_legacy_cache = not isinstance(past_key_values, Cache)
             if use_legacy_cache:
                 past_key_values = DynamicCache.from_legacy_cache(past_key_values)
+        if hasattr(past_key_values, "get_usable_length"):
             past_key_values_length = past_key_values.get_usable_length(seq_length)
+        else:
+            past_key_values_length = past_key_values.get_seq_length()
 
         if position_ids is None:
             device = input_ids.device if input_ids is not None else inputs_embeds.device
@@ -1940,6 +1953,8 @@ class MiniCPM3Model(MiniCPM3PreTrainedModel):
                     # arrange embeddings according to vision_patch_indices
                     # - text tokens are -1 (map to the dummy zero tensor)
                     # - vision tokens are 0~n_patches (map to the corresponding vision_embeds)
+                    if vision_patch_indices.max() >= vision_embeds.size(0):
+                        vision_patch_indices = vision_patch_indices.clamp(min=-1, max=vision_embeds.size(0) - 1)
                     vision_embeds = vision_embeds[
                         vision_patch_indices
                     ]  # (batch_size, seq_length, hidden_size)
@@ -2380,8 +2395,8 @@ class MiniCPM3ForCausalLM(MiniCPM3PreTrainedModel):
         if past_key_values is not None:
             if isinstance(past_key_values, Cache):
                 cache_length = past_key_values.get_seq_length()
-                past_length = past_key_values.seen_tokens
-                max_cache_length = past_key_values.get_max_length()
+                past_length = getattr(past_key_values, "seen_tokens", cache_length)
+                max_cache_length = past_key_values.get_max_length() if hasattr(past_key_values, "get_max_length") else None
             else:
                 cache_length = past_length = past_key_values[0][0].shape[2]
                 max_cache_length = None
