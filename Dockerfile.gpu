@@ -1,0 +1,42 @@
+# CMR-VLM GPU image (CUDA) with pinned dependency versions.
+#
+# Identical to Dockerfile except torch/torchvision are the CUDA 12.8 builds
+# (the pip cu128 wheels bundle their own CUDA libraries, so no NVIDIA CUDA
+# base image is required). The same patient-free smoke tests run unchanged;
+# they fall back to CPU when no GPU is attached.
+#
+# Build:
+#   docker build -f Dockerfile.gpu -t cmr-vlm:smoke-gpu .
+#
+# Run with a GPU (requires nvidia-container-toolkit on the host):
+#   docker run --rm --gpus all cmr-vlm:smoke-gpu
+#   docker run --rm --gpus all -e CMR_VLM_SKIP_FULL_LOAD=0 \
+#       -v /path/to/output:/data/output:ro cmr-vlm:smoke-gpu
+#
+# Without the toolkit the same image still runs the smoke tests on CPU.
+
+FROM python:3.10-slim
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    MPLBACKEND=Agg \
+    PYTHONPATH=/app
+
+WORKDIR /app
+
+# 1) PyTorch CUDA 12.8 wheels (pinned exact +cu128 builds; --extra-index-url
+#    keeps PyPI as the primary index for all other packages).
+RUN pip install \
+    torch==2.9.1+cu128 torchvision==0.24.1+cu128 \
+    --extra-index-url https://download.pytorch.org/whl/cu128
+
+# 2) Minimal pinned runtime dependencies for the smoke tests.
+COPY requirements-smoke.txt ./
+RUN pip install -r requirements-smoke.txt
+
+# 3) Repository code (model sources, verifier package, demo).
+COPY . .
+
+ENTRYPOINT ["bash", "docker/smoke.sh"]

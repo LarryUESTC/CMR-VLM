@@ -1,0 +1,18 @@
+# Minimal, versioned dependency set for the CMR-VLM installation smoke tests.
+#
+# Covers: demo.py, reproducibility/verify_patch_config.py (standard library only),
+# and reproducibility/smoke_load_checkpoint.py (full checkpoint load, CPU).
+#
+# torch / torchvision are installed separately from the official PyTorch CPU
+# index in the Dockerfile (see Dockerfile). No CUDA runtime is required for the
+# smoke tests.
+transformers==4.57.3
+huggingface_hub==0.34.0
+safetensors==0.7.0
+timm==1.0.22
+einops==0.8.0
+scipy==1.13.1
+numpy==1.26.4
+pillow==10.3.0
+matplotlib==3.8.4
+packaging==24.0

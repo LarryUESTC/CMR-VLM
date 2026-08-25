@@ -28,11 +28,57 @@ CMR-VLM is a vision–language foundation model designed for multi-sequence 4D c
 
 ## Installation
 
+### Docker (recommended, clean install with pinned versions)
+
+A verified container image with pinned dependency versions runs all patient-free
+smoke tests. Without the checkpoint mounted it runs the installation check, the
+lightweight demo, and the verifier unit tests; with the checkpoint mounted it
+additionally runs the checkpoint-header checks and the strict full checkpoint
+load:
+
+```bash
+docker build -t cmr-vlm:smoke .
+docker run --rm cmr-vlm:smoke
+```
+
+To also run the checkpoint-header checks and the full checkpoint-load smoke,
+bind-mount the released checkpoint directory (which contains
+`model-*.safetensors` and `model.safetensors.index.json`):
+
+```bash
+docker run --rm \
+  -e CMR_VLM_SKIP_FULL_LOAD=0 \
+  -v /path/to/CLIP_biomed_all_v3_nom_seg_vstlge_fix2_Class3_nonpy_KMSCSCD_9_32:/data/output/CLIP_biomed_all_v3_nom_seg_vstlge_fix2_Class3_nonpy_KMSCSCD_9_32:ro \
+  cmr-vlm:smoke
+```
+
+Expected output: `torch.Size([1, 16, 256])` for the demo, `6/6` verifier unit
+tests, `21/21` checkpoint-header checks, and `PASS` with 4,177,150,750
+parameters for the full load. All smoke tests are patient-free and do not
+reproduce clinical performance.
+
+The minimal pinned dependency set is [requirements-smoke.txt](requirements-smoke.txt);
+the full development-environment export remains in
+[requirements.txt](requirements.txt). The verification package is documented in
+[reproducibility/README.md](reproducibility/README.md).
+
+A CUDA variant with the same pinned versions is available as
+[Dockerfile.gpu](Dockerfile.gpu) (`docker build -f Dockerfile.gpu -t cmr-vlm:smoke-gpu .`;
+run with `docker run --rm --gpus all cmr-vlm:smoke-gpu`, which requires
+nvidia-container-toolkit on the host). The smoke tests themselves are
+CPU-compatible and do not require a GPU.
+
+### Conda
+
 ```bash
 conda env create -f environment.yml
 conda activate solo
 pip install -r requirements.txt
 ```
+
+Note: `environment.yml`/`requirements.txt` are a development-environment export;
+the Docker path above is the tested clean-install route. `demo.py` requires
+`huggingface-hub` within `[0.34.0, 1.0.0)`.
 
 ## Data
 

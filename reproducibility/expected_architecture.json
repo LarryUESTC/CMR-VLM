@@ -1,0 +1,54 @@
+{
+  "schema_version": "1.0",
+  "model_class": "MiniCPM3Model",
+  "training_entry": "legacy_experiments/train/train_CLIP_biomed_cmp4b_ALL_V3_loss_seg_vstlge_fix_Class6_3.py",
+  "paper_evaluation_entry": "CMR-VLM_Paper/revision_experiments_code/03_center_protocol_generalization/eval_paper_legacy_common_centerwise.py",
+  "model_source": "scripts/model/modeling_minicpm_solo_vst_lge6_4.py",
+  "release_model_source": "scripts/model/modeling_minicpm_solo_vst_lge6_4.py",
+  "paper_checkpoint": "output/CLIP_biomed_all_v3_nom_seg_vstlge_fix2_Class3_nonpy_KMSCSCD_9_32",
+  "encoders": [
+    {
+      "id": "fch",
+      "sequence": "4CH cine",
+      "source_attribute": "vision_encoder_fch",
+      "encoder_class": "SwinTransformer3D",
+      "input_order": ["batch", "channel", "time", "height", "width"],
+      "patch_size": [3, 4, 4],
+      "patch_axes": ["time", "height", "width"],
+      "window_size": [2, 7, 7],
+      "window_axes": ["time", "height", "width"],
+      "checkpoint_kernel_key": "model.vision_encoder_fch.patch_embed.proj.weight",
+      "checkpoint_window_key": "model.vision_encoder_fch.layers.0.blocks.0.attn.relative_position_bias_table",
+      "interpretation": "Each initial token spans 3 sampled cine frames and a 4 x 4 pixel region on the preprocessed 192 x 192 grid. The nominal attention window contains up to 2 x 7 x 7 patch tokens."
+    },
+    {
+      "id": "sax",
+      "sequence": "SAX cine",
+      "source_attribute": "vision_encoder_SAX",
+      "encoder_class": "SwinTransformer4D",
+      "input_order": ["slice", "channel", "time", "height", "width"],
+      "encoder_order": ["time", "channel", "slice", "height", "width"],
+      "patch_size": [3, 4, 4],
+      "patch_axes": ["slice", "height", "width"],
+      "window_size": [2, 7, 7],
+      "window_axes": ["slice", "height", "width"],
+      "checkpoint_kernel_key": "model.vision_encoder_SAX.patch_embed.proj.weight",
+      "checkpoint_window_key": "model.vision_encoder_SAX.layers.0.blocks.0.attn.relative_position_bias_table",
+      "interpretation": "At each cardiac phase, each initial token spans 3 selected slice positions in the ordered, preprocessed SAX stack and a 4 x 4 pixel region on the preprocessed grid. Time is not part of this patch tuple; cardiac phases remain a separate leading dimension in this factorized pathway."
+    },
+    {
+      "id": "lge",
+      "sequence": "SAX LGE",
+      "source_attribute": "vision_encoder_LGE",
+      "encoder_class": "SwinTransformer3D",
+      "input_order": ["batch", "channel", "slice", "height", "width"],
+      "patch_size": [1, 4, 4],
+      "patch_axes": ["slice", "height", "width"],
+      "window_size": [1, 7, 7],
+      "window_axes": ["slice", "height", "width"],
+      "checkpoint_kernel_key": "model.vision_encoder_LGE.patch_embed.proj.weight",
+      "checkpoint_window_key": "model.vision_encoder_LGE.layers.0.blocks.0.attn.relative_position_bias_table",
+      "interpretation": "A slice-axis kernel and window of 1 make this equivalent to slice-wise 2D processing with 4 x 4 pixel patches on the preprocessed 192 x 192 grid and 7 x 7 spatial patch-token windows."
+    }
+  ]
+}
