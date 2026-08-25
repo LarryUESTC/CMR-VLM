@@ -1,5 +1,7 @@
 import random
 import os
+from pathlib import Path
+from collections import Counter
 import numpy as np
 import torch
 from torch.utils.data import Dataset, ConcatDataset
@@ -31,16 +33,87 @@ IMAGE_SIZE = 320
 CROP_SIZE = 192
 FRAME_INTERVAL = 3
 
+FILE_DIR = Path(__file__).resolve().parent
+CMR_VLM_ROOT = FILE_DIR.parents[1]
+WORKSPACE_ROOT = FILE_DIR.parents[2]
+LOCAL_DATA_ROOTS = []
+if os.environ.get("CMR_DATA_ROOT"):
+    LOCAL_DATA_ROOTS.append(Path(os.environ["CMR_DATA_ROOT"]).expanduser())
+LOCAL_DATA_ROOTS.append(Path("/home/Larry/data"))
+
+
+def _resolve_data_path(raw_path):
+    path = Path(raw_path).expanduser()
+    candidates = []
+
+    if path.is_absolute():
+        candidates.append(path)
+    else:
+        for root in (Path.cwd(), WORKSPACE_ROOT, CMR_VLM_ROOT):
+            candidates.append((root / path).resolve())
+        if path.parts and path.parts[0] == "data":
+            suffix = Path(*path.parts[1:])
+            for data_root in LOCAL_DATA_ROOTS:
+                candidates.append((data_root / suffix).resolve())
+
+    seen = set()
+    for candidate in candidates:
+        candidate_str = str(candidate)
+        if candidate_str in seen:
+            continue
+        seen.add(candidate_str)
+        if candidate.exists():
+            return candidate_str
+
+    return str(path)
+
+
+def _is_eval_mode(mode):
+    return mode in {"validation", "test"}
+
+
+def _select_symbol(symbols, mode):
+    if not symbols:
+        raise ValueError("No sequence symbols available.")
+    if _is_eval_mode(mode):
+        return symbols[0]
+    return random.choice(symbols)
+
+
+def _select_group_item(items, mode):
+    if not items:
+        raise ValueError("No sequence items available.")
+    if _is_eval_mode(mode):
+        return items[len(items) // 2]
+    return random.choice(items)
+
+
+def _select_lge_pairs(indexed_items, sample_count, mode):
+    if sample_count <= 0:
+        return []
+    if _is_eval_mode(mode):
+        return indexed_items[:sample_count]
+    return random.sample(indexed_items, sample_count)
+
+
+def _select_start_frame(num_frames, max_frame_num, mode):
+    if max_frame_num >= num_frames:
+        return 0
+    if _is_eval_mode(mode):
+        return 0
+    return random.randint(0, num_frames - max_frame_num)
+
 def _load_excel_columns(excel_path):
-    if not excel_path or not os.path.exists(excel_path):
+    resolved_path = _resolve_data_path(excel_path)
+    if not resolved_path or not os.path.exists(resolved_path):
         return {}
-    df = pd.read_excel(excel_path)
+    df = pd.read_excel(resolved_path)
     return {column: df[column].tolist() for column in df.columns}
 
-KM_excel_path = os.environ.get("KM_EXCEL_PATH", "data/NEW2014.9-2024.12.15CMR_concept_add_add_step10_Question_oc_R1_T.xlsx")
-SCS_excel_path = os.environ.get("SCS_EXCEL_PATH", "data/SCS_CMR_dcm_step8_cleaned_T.xlsx")
-CD_excel_path = os.environ.get("CD_EXCEL_PATH", "data/CD_515_step8_Question_oc_V3_merged_result3_T.xlsx")
-YA_excel_path = os.environ.get("YA_EXCEL_PATH", "data/YA690_CMR3_S1.xlsx")
+KM_excel_path = _resolve_data_path(os.environ.get("KM_EXCEL_PATH", "data/NEW2014.9-2024.12.15CMR_concept_add_add_step10_Question_oc_R1_T.xlsx"))
+SCS_excel_path = _resolve_data_path(os.environ.get("SCS_EXCEL_PATH", "data/SCS_CMR_dcm_step8_cleaned_T.xlsx"))
+CD_excel_path = _resolve_data_path(os.environ.get("CD_EXCEL_PATH", "data/CD_515_step8_Question_oc_V3_merged_result3_T.xlsx"))
+YA_excel_path = _resolve_data_path(os.environ.get("YA_EXCEL_PATH", "data/YA690_CMR3_S1.xlsx"))
 
 G_KM_columns_as_lists = _load_excel_columns(KM_excel_path)
 G_SCS_columns_as_lists = _load_excel_columns(SCS_excel_path)
@@ -261,6 +334,74 @@ CLASSES_EN_4 = [
     ('Systemic Disease-related Heart Disease', 'SDRHD'), #Myocarditis Associated with Autoimmune Rheumatic Diseases
     ('Stroke', 'S')
 ]
+
+
+def _normalize_class_alias(value):
+    if value is None:
+        return ""
+    return re.sub(r"[\s_\-]+", "", str(value)).strip().lower()
+
+
+def _register_class_alias(alias_map, canonical_name, *aliases):
+    for alias in aliases:
+        if alias is None:
+            continue
+        alias_map[_normalize_class_alias(alias)] = canonical_name
+
+
+def _build_class_alias_map():
+    alias_map = {}
+
+    for cn_name, en_name in zip(CLASSES_CN, CLASSES_EN):
+        _register_class_alias(alias_map, cn_name, cn_name, en_name)
+    for cn_name, en_name in zip(CLASSES_CN_2, CLASSES_EN_2):
+        _register_class_alias(alias_map, cn_name, cn_name, en_name)
+    for cn_name, en_name in zip(CLASSES_CN_3, CLASSES_EN_3):
+        _register_class_alias(alias_map, cn_name, cn_name, en_name)
+    for cn_name, en_info in zip(CLASSES_CN_4, CLASSES_EN_4):
+        if isinstance(en_info, tuple):
+            _register_class_alias(alias_map, cn_name, cn_name, *en_info)
+        else:
+            _register_class_alias(alias_map, cn_name, cn_name, en_info)
+
+    return alias_map
+
+
+CLASS_ALIAS_MAP = _build_class_alias_map()
+
+
+def _parse_diagnosis_filter(raw_value, allowed_classes=None):
+    if not raw_value:
+        return []
+
+    resolved = []
+    unresolved = []
+    allowed_classes = list(allowed_classes or [])
+    allowed_lookup = {
+        _normalize_class_alias(class_name): class_name
+        for class_name in allowed_classes
+    }
+
+    for item in re.split(r"[;,|]", str(raw_value)):
+        item = item.strip()
+        if not item:
+            continue
+
+        normalized = _normalize_class_alias(item)
+        canonical_name = CLASS_ALIAS_MAP.get(normalized) or allowed_lookup.get(normalized)
+        if canonical_name is None:
+            unresolved.append(item)
+            continue
+        if allowed_classes and canonical_name not in allowed_classes:
+            unresolved.append(item)
+            continue
+        if canonical_name not in resolved:
+            resolved.append(canonical_name)
+
+    if unresolved:
+        print(f"[dataset] Warning: unresolved exclude_diagnoses entries ignored: {unresolved}")
+
+    return resolved
 
 
 # '心肌淀粉样变',
@@ -2407,7 +2548,7 @@ class SAXCineDataset_CMR_3DFilm_vst(Dataset):
     def preprocess_image_text_squence(self, data):
 
         try:
-            symbol = random.choice(data['SAX']['json_item_squence_symbol'])
+            symbol = _select_symbol(data['SAX']['json_item_squence_symbol'], self.mode)
             symbol_indice = data['SAX']['json_item_squence_symbol'].index(symbol)
         except:
             output_data_list = [[], [], []]
@@ -2440,7 +2581,7 @@ class SAXCineDataset_CMR_3DFilm_vst(Dataset):
         # sax_sq1 = list(set(sax_sqs) & set(['SAX_'+symbol+'_'+str(i) for i in [1,2,3]]))
         sax_sq1 = sax_sqs_select[:sax_pakge_len]
         if len(sax_sq1) > 0:
-            sax_sq_names.append(random.choice(sax_sq1))
+            sax_sq_names.append(_select_group_item(sax_sq1, self.mode))
             sax_sq_ids.append(sax_sqs.index(sax_sq_names[-1]))
         else:
             sax_sq_names.append(None)
@@ -2449,7 +2590,7 @@ class SAXCineDataset_CMR_3DFilm_vst(Dataset):
         # sax_sq2 = list(set(sax_sqs) & set(['SAX_'+symbol+'_'+str(i) for i in [4,5,6]]))
         sax_sq2 = sax_sqs_select[sax_pakge_len:2 * sax_pakge_len]
         if len(sax_sq2) > 0:
-            sax_sq_names.append(random.choice(sax_sq2))
+            sax_sq_names.append(_select_group_item(sax_sq2, self.mode))
             sax_sq_ids.append(sax_sqs.index(sax_sq_names[-1]))
         else:
             sax_sq_names.append(None)
@@ -2458,7 +2599,7 @@ class SAXCineDataset_CMR_3DFilm_vst(Dataset):
         # sax_sq3 = list(set(sax_sqs) & set(['SAX_'+symbol+'_'+str(i) for i in [7,8,9]]))
         sax_sq3 = sax_sqs_select[2 * sax_pakge_len:]
         if len(sax_sq3) > 0:
-            sax_sq_names.append(random.choice(sax_sq3))
+            sax_sq_names.append(_select_group_item(sax_sq3, self.mode))
             sax_sq_ids.append(sax_sqs.index(sax_sq_names[-1]))
         else:
             sax_sq_names.append(None)
@@ -2471,11 +2612,11 @@ class SAXCineDataset_CMR_3DFilm_vst(Dataset):
             else:
                 img_paths = data['SAX']['json_item_squence'][symbol_indice]['json_item_slice'][sax_sq_id]['Image_path']
                 max_frame_num = min(30, len(img_paths))
-                # start_frame = random.randint(0, len(img_paths) - max_frame_num)
+                # start_frame = _select_start_frame(len(img_paths), max_frame_num, self.mode)
                 # img_paths = img_paths[start_frame:start_frame + max_frame_num]  # [::frame_interval]
                 # if self.mode == 'train':
                 #     max_frame_num = min(30, len(img_paths))
-                #     start_frame = random.randint(0, len(img_paths) - max_frame_num)
+                #     start_frame = _select_start_frame(len(img_paths), max_frame_num, self.mode)
                 #     img_paths = img_paths[start_frame:start_frame + max_frame_num]  # [::frame_interval]
                 # else:
                 #     img_paths = img_paths  # [0:30] #[::frame_interval]
@@ -2487,7 +2628,7 @@ class SAXCineDataset_CMR_3DFilm_vst(Dataset):
     def preprocess_image_text_squence_numpy(self, data):
 
         try:
-            symbol = random.choice(data['SAX']['json_item_squence_symbol'])
+            symbol = _select_symbol(data['SAX']['json_item_squence_symbol'], self.mode)
             symbol_indice = data['SAX']['json_item_squence_symbol'].index(symbol)
         except:
             output_data_list = [[], [], []]
@@ -2526,7 +2667,7 @@ class SAXCineDataset_CMR_3DFilm_vst(Dataset):
         # sax_sq1 = list(set(sax_sqs) & set(['SAX_'+symbol+'_'+str(i) for i in [1,2,3]]))
         sax_sq1 = sax_sqs_select[:sax_pakge_len]
         if len(sax_sq1) > 0:
-            sax_sq_names.append(random.choice(sax_sq1))
+            sax_sq_names.append(_select_group_item(sax_sq1, self.mode))
             sax_sq_ids.append(sax_sqs.index(sax_sq_names[-1]))
         else:
             sax_sq_names.append(None)
@@ -2535,7 +2676,7 @@ class SAXCineDataset_CMR_3DFilm_vst(Dataset):
         # sax_sq2 = list(set(sax_sqs) & set(['SAX_'+symbol+'_'+str(i) for i in [4,5,6]]))
         sax_sq2 = sax_sqs_select[sax_pakge_len:2 * sax_pakge_len]
         if len(sax_sq2) > 0:
-            sax_sq_names.append(random.choice(sax_sq2))
+            sax_sq_names.append(_select_group_item(sax_sq2, self.mode))
             sax_sq_ids.append(sax_sqs.index(sax_sq_names[-1]))
         else:
             sax_sq_names.append(None)
@@ -2544,7 +2685,7 @@ class SAXCineDataset_CMR_3DFilm_vst(Dataset):
         # sax_sq3 = list(set(sax_sqs) & set(['SAX_'+symbol+'_'+str(i) for i in [7,8,9]]))
         sax_sq3 = sax_sqs_select[2 * sax_pakge_len:]
         if len(sax_sq3) > 0:
-            sax_sq_names.append(random.choice(sax_sq3))
+            sax_sq_names.append(_select_group_item(sax_sq3, self.mode))
             sax_sq_ids.append(sax_sqs.index(sax_sq_names[-1]))
         else:
             sax_sq_names.append(None)
@@ -2557,11 +2698,11 @@ class SAXCineDataset_CMR_3DFilm_vst(Dataset):
             else:
                 img_paths = data['SAX']['json_item_squence'][symbol_indice]['json_item_slice'][sax_sq_id]['Image_path']
                 max_frame_num = min(30, len(img_paths))
-                start_frame = random.randint(0, len(img_paths) - max_frame_num)
+                start_frame = _select_start_frame(len(img_paths), max_frame_num, self.mode)
                 img_paths = img_paths[start_frame:start_frame + max_frame_num]  # [::frame_interval]
                 # if self.mode == 'train':
                 #     max_frame_num = min(30, len(img_paths))
-                #     start_frame = random.randint(0, len(img_paths) - max_frame_num)
+                #     start_frame = _select_start_frame(len(img_paths), max_frame_num, self.mode)
                 #     img_paths = img_paths[start_frame:start_frame + max_frame_num]  # [::frame_interval]
                 # else:
                 #     img_paths = img_paths  # [0:30] #[::frame_interval]
@@ -2909,7 +3050,7 @@ class SAXCineDataset_CMR_3DFilm_vst_ALL(Dataset):
     def preprocess_image_text_squence(self, data):
 
         try:
-            symbol = random.choice(data['SAX']['json_item_squence_symbol'])
+            symbol = _select_symbol(data['SAX']['json_item_squence_symbol'], self.mode)
             symbol_indice = data['SAX']['json_item_squence_symbol'].index(symbol)
         except:
             output_data_list = [[], [], []]
@@ -2948,11 +3089,11 @@ class SAXCineDataset_CMR_3DFilm_vst_ALL(Dataset):
             else:
                 img_paths = data['SAX']['json_item_squence'][symbol_indice]['json_item_slice'][sax_sq_id]['Image_path']
                 max_frame_num = min(30, len(img_paths))
-                # start_frame = random.randint(0, len(img_paths) - max_frame_num)
+                # start_frame = _select_start_frame(len(img_paths), max_frame_num, self.mode)
                 img_paths = img_paths[:max_frame_num]  # [::frame_interval]
                 # if self.mode == 'train':
                 #     max_frame_num = min(30, len(img_paths))
-                #     start_frame = random.randint(0, len(img_paths) - max_frame_num)
+                #     start_frame = _select_start_frame(len(img_paths), max_frame_num, self.mode)
                 #     img_paths = img_paths[start_frame:start_frame + max_frame_num]  # [::frame_interval]
                 # else:
                 #     img_paths = img_paths  # [0:30] #[::frame_interval]
@@ -2964,7 +3105,7 @@ class SAXCineDataset_CMR_3DFilm_vst_ALL(Dataset):
     def preprocess_image_text_squence_numpy(self, data):
 
         try:
-            symbol = random.choice(data['SAX']['json_item_squence_symbol'])
+            symbol = _select_symbol(data['SAX']['json_item_squence_symbol'], self.mode)
             symbol_indice = data['SAX']['json_item_squence_symbol'].index(symbol)
         except:
             output_data_list = [[], [], []]
@@ -3003,7 +3144,7 @@ class SAXCineDataset_CMR_3DFilm_vst_ALL(Dataset):
         # sax_sq1 = list(set(sax_sqs) & set(['SAX_'+symbol+'_'+str(i) for i in [1,2,3]]))
         sax_sq1 = sax_sqs_select[:sax_pakge_len]
         if len(sax_sq1) > 0:
-            sax_sq_names.append(random.choice(sax_sq1))
+            sax_sq_names.append(_select_group_item(sax_sq1, self.mode))
             sax_sq_ids.append(sax_sqs.index(sax_sq_names[-1]))
         else:
             sax_sq_names.append(None)
@@ -3012,7 +3153,7 @@ class SAXCineDataset_CMR_3DFilm_vst_ALL(Dataset):
         # sax_sq2 = list(set(sax_sqs) & set(['SAX_'+symbol+'_'+str(i) for i in [4,5,6]]))
         sax_sq2 = sax_sqs_select[sax_pakge_len:2 * sax_pakge_len]
         if len(sax_sq2) > 0:
-            sax_sq_names.append(random.choice(sax_sq2))
+            sax_sq_names.append(_select_group_item(sax_sq2, self.mode))
             sax_sq_ids.append(sax_sqs.index(sax_sq_names[-1]))
         else:
             sax_sq_names.append(None)
@@ -3021,7 +3162,7 @@ class SAXCineDataset_CMR_3DFilm_vst_ALL(Dataset):
         # sax_sq3 = list(set(sax_sqs) & set(['SAX_'+symbol+'_'+str(i) for i in [7,8,9]]))
         sax_sq3 = sax_sqs_select[2 * sax_pakge_len:]
         if len(sax_sq3) > 0:
-            sax_sq_names.append(random.choice(sax_sq3))
+            sax_sq_names.append(_select_group_item(sax_sq3, self.mode))
             sax_sq_ids.append(sax_sqs.index(sax_sq_names[-1]))
         else:
             sax_sq_names.append(None)
@@ -3034,11 +3175,11 @@ class SAXCineDataset_CMR_3DFilm_vst_ALL(Dataset):
             else:
                 img_paths = data['SAX']['json_item_squence'][symbol_indice]['json_item_slice'][sax_sq_id]['Image_path']
                 max_frame_num = min(30, len(img_paths))
-                start_frame = random.randint(0, len(img_paths) - max_frame_num)
+                start_frame = _select_start_frame(len(img_paths), max_frame_num, self.mode)
                 img_paths = img_paths[start_frame:start_frame + max_frame_num]  # [::frame_interval]
                 # if self.mode == 'train':
                 #     max_frame_num = min(30, len(img_paths))
-                #     start_frame = random.randint(0, len(img_paths) - max_frame_num)
+                #     start_frame = _select_start_frame(len(img_paths), max_frame_num, self.mode)
                 #     img_paths = img_paths[start_frame:start_frame + max_frame_num]  # [::frame_interval]
                 # else:
                 #     img_paths = img_paths  # [0:30] #[::frame_interval]
@@ -3418,7 +3559,7 @@ class SAXCineDataset_CMR_3DFilm_vst_location(Dataset):
     def preprocess_image_text_squence_numpy(self, data):
 
         try:
-            symbol = random.choice(data['SAX']['json_item_squence_symbol'])
+            symbol = _select_symbol(data['SAX']['json_item_squence_symbol'], self.mode)
             symbol_indice = data['SAX']['json_item_squence_symbol'].index(symbol)
         except:
             output_data_list = [[], [], []]
@@ -3457,7 +3598,7 @@ class SAXCineDataset_CMR_3DFilm_vst_location(Dataset):
         # sax_sq1 = list(set(sax_sqs) & set(['SAX_'+symbol+'_'+str(i) for i in [1,2,3]]))
         sax_sq1 = sax_sqs_select[:sax_pakge_len]
         if len(sax_sq1) > 0:
-            sax_sq_names.append(random.choice(sax_sq1))
+            sax_sq_names.append(_select_group_item(sax_sq1, self.mode))
             sax_sq_ids.append(sax_sqs.index(sax_sq_names[-1]))
         else:
             sax_sq_names.append(None)
@@ -3466,7 +3607,7 @@ class SAXCineDataset_CMR_3DFilm_vst_location(Dataset):
         # sax_sq2 = list(set(sax_sqs) & set(['SAX_'+symbol+'_'+str(i) for i in [4,5,6]]))
         sax_sq2 = sax_sqs_select[sax_pakge_len:2 * sax_pakge_len]
         if len(sax_sq2) > 0:
-            sax_sq_names.append(random.choice(sax_sq2))
+            sax_sq_names.append(_select_group_item(sax_sq2, self.mode))
             sax_sq_ids.append(sax_sqs.index(sax_sq_names[-1]))
         else:
             sax_sq_names.append(None)
@@ -3475,7 +3616,7 @@ class SAXCineDataset_CMR_3DFilm_vst_location(Dataset):
         # sax_sq3 = list(set(sax_sqs) & set(['SAX_'+symbol+'_'+str(i) for i in [7,8,9]]))
         sax_sq3 = sax_sqs_select[2 * sax_pakge_len:]
         if len(sax_sq3) > 0:
-            sax_sq_names.append(random.choice(sax_sq3))
+            sax_sq_names.append(_select_group_item(sax_sq3, self.mode))
             sax_sq_ids.append(sax_sqs.index(sax_sq_names[-1]))
         else:
             sax_sq_names.append(None)
@@ -3488,11 +3629,11 @@ class SAXCineDataset_CMR_3DFilm_vst_location(Dataset):
             else:
                 img_paths = data['SAX']['json_item_squence'][symbol_indice]['json_item_slice'][sax_sq_id]['Image_path']
                 max_frame_num = min(30, len(img_paths))
-                start_frame = random.randint(0, len(img_paths) - max_frame_num)
+                start_frame = _select_start_frame(len(img_paths), max_frame_num, self.mode)
                 img_paths = img_paths[start_frame:start_frame + max_frame_num]  # [::frame_interval]
                 # if self.mode == 'train':
                 #     max_frame_num = min(30, len(img_paths))
-                #     start_frame = random.randint(0, len(img_paths) - max_frame_num)
+                #     start_frame = _select_start_frame(len(img_paths), max_frame_num, self.mode)
                 #     img_paths = img_paths[start_frame:start_frame + max_frame_num]  # [::frame_interval]
                 # else:
                 #     img_paths = img_paths  # [0:30] #[::frame_interval]
@@ -3544,7 +3685,7 @@ class SAXCineDataset_CMR_3DFilm_vst_location(Dataset):
     #             data = self.data_list[idx]
     #             img_paths = data["image_path"]
     #             max_frame_num = min(30, len(img_paths))
-    #             start_frame = random.randint(0, len(img_paths) - max_frame_num)
+    #             start_frame = _select_start_frame(len(img_paths), max_frame_num, self.mode)
     #             img_paths = img_paths[start_frame:start_frame + max_frame_num]  # [::frame_interval]
     #
     #             img_paths = img_paths[::FRAME_INTERVAL]
@@ -3771,7 +3912,7 @@ class FCHCineDataset_CMR_2DFilm_vst(Dataset):
     def preprocess_image_text_squence(self, data):
         frame_interval = FRAME_INTERVAL
         try:
-            symbol = random.choice(data['4CH']['json_item_squence_symbol'])
+            symbol = _select_symbol(data['4CH']['json_item_squence_symbol'], self.mode)
             symbol_indice = data['4CH']['json_item_squence_symbol'].index(symbol)
         except:
             output_data_list = [[]]
@@ -3796,7 +3937,7 @@ class FCHCineDataset_CMR_2DFilm_vst(Dataset):
         # output_text_list = 'Cardiac morphology: ' + self.columns_as_lists['心脏形态step2E'][excel_id]
         fch_sqs = data['4CH']['json_item_squence'][symbol_indice]['sorted_file_names']
 
-        fch_sq_name = random.choice(fch_sqs)
+        fch_sq_name = _select_group_item(fch_sqs, self.mode)
         fch_sq_id = fch_sqs.index(fch_sq_name)
 
         selected_data_path = []
@@ -3804,7 +3945,7 @@ class FCHCineDataset_CMR_2DFilm_vst(Dataset):
         img_paths = data['4CH']['json_item_squence'][symbol_indice]['json_item_slice'][fch_sq_id]['Image_path']
         # if self.mode == 'train':
         #     max_frame_num = min(30, len(img_paths))
-        #     start_frame = random.randint(0, len(img_paths) - max_frame_num)
+        #     start_frame = _select_start_frame(len(img_paths), max_frame_num, self.mode)
         #     img_paths = img_paths[start_frame:start_frame + max_frame_num]  # [::frame_interval]
         # else:
         #     img_paths = img_paths[0:30]  # [::frame_interval]
@@ -4051,7 +4192,7 @@ class LGEDataset_CMR_3D_ST(Dataset):
 
     def preprocess_image_text_squence(self, data):
         try:
-            symbol = random.choice(data['LGE']['json_item_squence_symbol'])
+            symbol = _select_symbol(data['LGE']['json_item_squence_symbol'], self.mode)
             symbol_indice = data['LGE']['json_item_squence_symbol'].index(symbol)
         except:
             output_data_list = [[]]
@@ -4074,7 +4215,7 @@ class LGEDataset_CMR_3D_ST(Dataset):
         lge_indexed_list = list(enumerate(lge_sqs))
 
         # 随机抽取 10 个（索引，值）对
-        sampled_pairs = random.sample(lge_indexed_list, lge_num)
+        sampled_pairs = _select_lge_pairs(lge_indexed_list, lge_num, self.mode)
 
         # 分离索引和值
         lge_sq_ids = [pair[0] for pair in sampled_pairs]
@@ -4368,7 +4509,7 @@ class LGEDataset_CMR_3D_vst(Dataset):
 
     def preprocess_image_text_squence(self, data):
         try:
-            symbol = random.choice(data['LGE']['json_item_squence_symbol'])
+            symbol = _select_symbol(data['LGE']['json_item_squence_symbol'], self.mode)
             symbol_indice = data['LGE']['json_item_squence_symbol'].index(symbol)
         except:
             output_data_list = [[]]
@@ -5027,6 +5168,139 @@ class UniDatasets_tsvlge(Dataset):
         print(CLASSES_CN)
         return valid_idx
 
+    def _question_candidate_ids(self, prompt_mode):
+        if prompt_mode == 'Question_open':
+            if self.Multi_center == 'CD':
+                return [
+                    'Question_open',
+                    'Question_open_R1',
+                    'Question_open',
+                    'Question_open_R1',
+                    'Question_open_no_2',
+                    'Question_open_no_3',
+                ]
+            else:
+                return ['Question_open', 'Question_open_R1']
+        else:
+            return ['Question_close', 'Question_close_R1']
+
+    def _available_question_entries(self, excel_id, prompt_mode):
+        available_entries = []
+        for question_id in self._question_candidate_ids(prompt_mode):
+            column = self.G_columns_as_lists.get(question_id)
+            if column is None:
+                continue
+            try:
+                data_str = column[excel_id]
+            except Exception:
+                continue
+            if data_str:
+                available_entries.append((question_id, data_str))
+
+        return available_entries
+
+    def filter_valid_question_idx(self):
+        valid_idx = []
+        for data_index, data in enumerate(self.data_list):
+            excel_id = data['Text']['excel_id']
+            if self._available_question_entries(excel_id, self.prompt_mode):
+                valid_idx.append(data_index)
+        print(f"Valid {self.prompt_mode} samples: {len(valid_idx)}")
+        return valid_idx
+
+    def _sample_question_entry(self, excel_id, prompt_mode):
+        available_entries = self._available_question_entries(excel_id, prompt_mode)
+
+        if not available_entries:
+            raise KeyError(
+                f"missing question data for prompt_mode={prompt_mode}, "
+                f"center={self.Multi_center}, excel_id={excel_id}"
+            )
+
+        return random.choice(available_entries)
+
+    def _question_candidate_ids(self, prompt_mode):
+        if prompt_mode == 'Question_open':
+            if self.Multi_center == 'CD':
+                return [
+                    'Question_open',
+                    'Question_open_R1',
+                    'Question_open',
+                    'Question_open_R1',
+                    'Question_open_no_2',
+                    'Question_open_no_3',
+                ]
+            return ['Question_open', 'Question_open_R1']
+        return ['Question_close', 'Question_close_R1']
+
+    def _available_question_entries(self, excel_id, prompt_mode):
+        available_entries = []
+        for question_id in self._question_candidate_ids(prompt_mode):
+            column = self.G_columns_as_lists.get(question_id)
+            if column is None:
+                continue
+            try:
+                data_str = column[excel_id]
+            except Exception:
+                continue
+            if data_str:
+                available_entries.append((question_id, data_str))
+        return available_entries
+
+    def filter_valid_question_idx(self):
+        valid_idx = []
+        for data_index, data in enumerate(self.data_list):
+            excel_id = data['Text']['excel_id']
+            if self._available_question_entries(excel_id, self.prompt_mode):
+                valid_idx.append(data_index)
+        print(f"Valid {self.prompt_mode} samples: {len(valid_idx)}")
+        return valid_idx
+
+    def _sample_question_entry(self, excel_id, prompt_mode):
+        available_entries = self._available_question_entries(excel_id, prompt_mode)
+        if not available_entries:
+            raise KeyError(
+                f"missing question data for prompt_mode={prompt_mode}, "
+                f"center={self.Multi_center}, excel_id={excel_id}"
+            )
+        return random.choice(available_entries)
+
+    def _sample_question_entry(self, excel_id, prompt_mode):
+        if prompt_mode == 'Question_open':
+            if self.Multi_center == 'CD':
+                candidate_ids = [
+                    'Question_open',
+                    'Question_open_R1',
+                    'Question_open',
+                    'Question_open_R1',
+                    'Question_open_no_2',
+                    'Question_open_no_3',
+                ]
+            else:
+                candidate_ids = ['Question_open', 'Question_open_R1']
+        else:
+            candidate_ids = ['Question_close', 'Question_close_R1']
+
+        available_entries = []
+        for question_id in candidate_ids:
+            column = self.G_columns_as_lists.get(question_id)
+            if column is None:
+                continue
+            try:
+                data_str = column[excel_id]
+            except Exception:
+                continue
+            if data_str:
+                available_entries.append((question_id, data_str))
+
+        if not available_entries:
+            raise KeyError(
+                f"missing question data for prompt_mode={prompt_mode}, "
+                f"center={self.Multi_center}, excel_id={excel_id}"
+            )
+
+        return random.choice(available_entries)
+
     def prepare_inputs_img_text(self, input_img_tokens, input_img_patch_indices, input_text,
                                 tokenizer, clinical_infor = '',
                                 question_squeence_list = [3], question_id = 'Question_open', abnormal = ''):
@@ -5191,6 +5465,7 @@ class UniDatasets_tsvlge(Dataset):
     def __getitem__(self, idx):
         max_attempts = 10
         NON_VISION_TOKEN = -1
+        last_error = None
         for _ in range(max_attempts):
             try:
                 if self.prompt_mode == 'classification':
@@ -5320,17 +5595,8 @@ class UniDatasets_tsvlge(Dataset):
                     class_label = 'None'
                 elif self.prompt_mode == 'Question_open' or self.prompt_mode == 'Question_close':
                     question_squeence_list = question_squeence_list*5 + [3]
-                    question_id = 'Question_open'
-                    if self.prompt_mode == 'Question_open':
-                        if self.Multi_center == 'CD':
-                            question_id = random.choice(['Question_open', 'Question_open_R1', 'Question_open', 'Question_open_R1', 'Question_open_no_2', 'Question_open_no_3'])
-                            data_str = self.G_columns_as_lists[question_id][self.data_list[idx]['Text']['excel_id']]
-                        else:
-                            question_id = random.choice(['Question_open', 'Question_open_R1'])
-                            data_str = self.G_columns_as_lists[question_id][self.data_list[idx]['Text']['excel_id']]
-                    else:
-                        question_id =random.choice(['Question_close', 'Question_close_R1'])
-                        data_str = self.G_columns_as_lists[question_id][self.data_list[idx]['Text']['excel_id']]
+                    excel_id = self.data_list[idx]['Text']['excel_id']
+                    question_id, data_str = self._sample_question_entry(excel_id, self.prompt_mode)
 
                     # data_str = G_columns_as_lists['Question_close'][self.data_list[idx]['Text']['excel_id']]
                     tokens, attention_masks, patch_indices, labels, answer, question = self.prepare_inputs_img_text(
@@ -5452,782 +5718,412 @@ class UniDatasets_tsvlge(Dataset):
                 else:
                     idx = random.randint(0, len(self.dataset[0]) - 1)
 
-class UniDatasets_tsvlge_ALL(Dataset):
-    def __init__(self, args, tokenizer, mode="train", dataset_names=['FCH', 'SAX', 'LGE'], prompt_mode='classification',
-                 n_class=7, multilabel=False, use_seg=True, use_numpy = False, use_det = False, Multi_center = 'KM',
-                 abnormal_name= 'LVEDD'):
-        super(UniDatasets_tsvlge_ALL, self).__init__()
+# Shared multimodal dataset implementation for ALL / ALL2 / ALL3 variants.
+class _UniDatasetsTSVLGBase(Dataset):
+    QUESTION_PROMPT_MODES = {"Question_open", "Question_close"}
+    PRIMARY_CLASSES = CLASSES_CN
+    LGE_DATASET_CLS = LGEDataset_CMR_3D_ST
+    CLINICAL_INFO_CENTERS = {"KM", "CD", "SCS"}
+    KM_DIAGNOSIS_EXCLUDED_PROMPTS = set()
+    ENABLE_SECONDARY_CLASSES = False
+    ENABLE_SURVIVAL_PREPROCESS = False
+    NORMAL_CLASS_ALIASES = ("Normal", "正常")
+
+    def __init__(self, args, tokenizer, mode="train", dataset_names=None, prompt_mode='classification',
+                 n_class=7, multilabel=False, use_seg=True, use_numpy=False, use_det=False, Multi_center='KM',
+                 abnormal_name='LVEDD', class_names=None):
+        super().__init__()
         self.tokenizer = tokenizer
         self.args = args
         self.mode = mode
         self.Multi_center = Multi_center
-        print()
-        if Multi_center == 'KM':
-            with open(args.all_data_path, 'r') as file:
-                self.json_file = json.load(file)
-            self.G_columns_as_lists = G_KM_columns_as_lists
-            self.data_all_root = {
-                'image': args.data_root,
-                'LV_mask': args.seg_Lv_root,
-                'RV_mask': args.seg_Rv_root,
-                'MYO_mask': args.seg_MYO_root,
-                'DET_mask': args.det_km_root,
-            }
-            self.weights_df = calculate_cardiac_weights(KM_excel_path)
-        elif Multi_center == 'SCS':
-            with open(args.scs_data_path, 'r') as file:
-                self.json_file = json.load(file)
-            self.G_columns_as_lists = G_SCS_columns_as_lists
-            self.data_all_root = {
-                'image': args.scs_root,
-                'LV_mask': args.seg_scs_Lv_root,
-                'RV_mask': args.seg_scs_Rv_root,
-                'MYO_mask': args.seg_scs_MYO_root,
-                'DET_mask': args.det_scs_root,
-            }
-            self.weights_df = calculate_cardiac_weights(SCS_excel_path)
-        elif Multi_center == 'CD':
-            with open(args.cd_data_path, 'r') as file:
-                self.json_file = json.load(file)
-            self.G_columns_as_lists = G_CD_columns_as_lists
-            self.data_all_root = {
-                'image': args.cd_root,
-                'LV_mask': args.seg_cd_Lv_root,
-                'RV_mask': args.seg_cd_Rv_root,
-                'MYO_mask': args.seg_cd_MYO_root,
-                'DET_mask': args.det_cd_root,
-            }
-            self.weights_df = calculate_cardiac_weights(CD_excel_path)
-        elif Multi_center == 'NCSD':
-            with open(args.location_data_path3D, 'r') as file:
-                self.json_file = json.load(file)
-            self.data_all_root = {
-                'image': args.data_root,
-                'LV_mask': args.seg_cd_Lv_root,#!
-                'RV_mask': args.seg_cd_Rv_root,
-                'MYO_mask': args.seg_cd_MYO_root,
-            }
-        self.data_list = self.json_file[mode]
-        self.dataset = []
-        self.dataset_name = dataset_names
+        self.dataset_name = dataset_names or ['FCH', 'SAX', 'LGE']
+        self.prompt_mode = prompt_mode
         self.n_class = n_class
-        print(f'Number class: ' + str(self.n_class))
         self.multilabel = multilabel
         self.use_seg = use_seg
         self.use_numpy = use_numpy
         self.use_det = use_det
-        for dataset_name in dataset_names:
-            if dataset_name == 'SAX':
-                self.sax_dataset = SAXCineDataset_CMR_3DFilm_vst_ALL(self.args, self.data_all_root, self.tokenizer,
-                                                                 self.json_file, self.G_columns_as_lists, self.mode,
-                                                                 use_seg=self.use_seg, use_numpy = self.use_numpy, use_det =  self.use_det)
-                self.dataset.append(self.sax_dataset)
-            if dataset_name == 'FCH':
-                self.fch_dataset = FCHCineDataset_CMR_2DFilm_vst(self.args, self.data_all_root, self.tokenizer,
-                                                                 self.json_file, self.G_columns_as_lists,self.mode,
-                                                                 use_numpy = self.use_numpy)  # 4CH
-                self.dataset.append(self.fch_dataset)
-            if dataset_name == 'LGE':
-                self.lge_dataset = LGEDataset_CMR_3D_ST(self.args, self.data_all_root, self.tokenizer,
-                                                        self.json_file, self.G_columns_as_lists,self.mode,
-                                                        use_seg=self.use_seg, use_numpy = self.use_numpy, use_det = self.use_det)
-                self.dataset.append(self.lge_dataset)
-
+        self.abnormal_name = abnormal_name
         self.max_position_embeddings = 4096
-        self.prompt_mode = prompt_mode
-        self.abnormal_name =abnormal_name
+        self.CLASSES_CN = list(class_names or self.PRIMARY_CLASSES)
+        self._primary_class_cache = {}
+        self.excluded_classes = set(
+            _parse_diagnosis_filter(
+                getattr(self.args, "exclude_diagnoses", ""),
+                allowed_classes=self.CLASSES_CN,
+            )
+        )
+        self.classification_single_label_only = bool(
+            getattr(self.args, "classification_single_label_only", False)
+        )
+
+        print()
+        self._configure_center()
+        self.data_list = self.json_file[mode]
+        self.filtered_data_idx = self._build_filtered_data_indices()
+        self.dataset = self._build_datasets()
+        print(f'Number class: ' + str(self.n_class))
+
         if self.prompt_mode == 'classification':
             self.valid_idx = self.filter_class_label_numpy()
+        if self.prompt_mode in self.QUESTION_PROMPT_MODES:
+            self.valid_question_idx = self.filter_valid_question_idx()
+        if self.ENABLE_SECONDARY_CLASSES:
+            self.filter_class_label_numpy2()
+        if self.ENABLE_SURVIVAL_PREPROCESS and self.prompt_mode == 'mace':
+            self._preprocess_survival_data()
+
+    def _center_configs(self):
+        return {
+            'KM': {
+                'json_attr': 'all_data_path',
+                'columns': G_KM_columns_as_lists,
+                'roots': {
+                    'image': 'data_root',
+                    'LV_mask': 'seg_Lv_root',
+                    'RV_mask': 'seg_Rv_root',
+                    'MYO_mask': 'seg_MYO_root',
+                    'DET_mask': 'det_km_root',
+                },
+                'weights_excel': KM_excel_path,
+            },
+            'SCS': {
+                'json_attr': 'scs_data_path',
+                'columns': G_SCS_columns_as_lists,
+                'roots': {
+                    'image': 'scs_root',
+                    'LV_mask': 'seg_scs_Lv_root',
+                    'RV_mask': 'seg_scs_Rv_root',
+                    'MYO_mask': 'seg_scs_MYO_root',
+                    'DET_mask': 'det_scs_root',
+                },
+                'weights_excel': SCS_excel_path,
+            },
+            'CD': {
+                'json_attr': 'cd_data_path',
+                'columns': G_CD_columns_as_lists,
+                'roots': {
+                    'image': 'cd_root',
+                    'LV_mask': 'seg_cd_Lv_root',
+                    'RV_mask': 'seg_cd_Rv_root',
+                    'MYO_mask': 'seg_cd_MYO_root',
+                    'DET_mask': 'det_cd_root',
+                },
+                'weights_excel': CD_excel_path,
+            },
+            'NCSD': {
+                'json_attr': 'location_data_path3D',
+                'columns': {},
+                'roots': {
+                    'image': 'data_root',
+                    'LV_mask': 'seg_cd_Lv_root',
+                    'RV_mask': 'seg_cd_Rv_root',
+                    'MYO_mask': 'seg_cd_MYO_root',
+                },
+            },
+            **self.extra_center_configs(),
+        }
+
+    def extra_center_configs(self):
+        return {}
+
+    def _configure_center(self):
+        center_config = self._center_configs().get(self.Multi_center)
+        if center_config is None:
+            raise ValueError(f"Unsupported Multi_center: {self.Multi_center}")
+
+        json_path = _resolve_data_path(getattr(self.args, center_config['json_attr']))
+        with open(json_path, 'r') as file:
+            self.json_file = json.load(file)
+
+        if center_config.get('copy_train_to_test'):
+            self.json_file['test'] = self.json_file['train']
+
+        self.G_columns_as_lists = center_config.get('columns', {})
+        self.data_all_root = {
+            key: _resolve_data_path(getattr(self.args, attr_name))
+            for key, attr_name in center_config['roots'].items()
+        }
+
+        weights_excel = center_config.get('weights_excel')
+        if weights_excel:
+            self.weights_df = calculate_cardiac_weights(weights_excel)
+
+    def _build_datasets(self):
+        dataset_builders = {
+            'SAX': lambda: SAXCineDataset_CMR_3DFilm_vst_ALL(
+                self.args, self.data_all_root, self.tokenizer, self.json_file, self.G_columns_as_lists, self.mode,
+                use_seg=self.use_seg, use_numpy=self.use_numpy, use_det=self.use_det,
+            ),
+            'FCH': lambda: FCHCineDataset_CMR_2DFilm_vst(
+                self.args, self.data_all_root, self.tokenizer, self.json_file, self.G_columns_as_lists, self.mode,
+                use_numpy=self.use_numpy,
+            ),
+            'LGE': lambda: self.LGE_DATASET_CLS(
+                self.args, self.data_all_root, self.tokenizer, self.json_file, self.G_columns_as_lists, self.mode,
+                use_seg=self.use_seg, use_numpy=self.use_numpy, use_det=self.use_det,
+            ),
+        }
+
+        datasets = []
+        for dataset_name in self.dataset_name:
+            builder = dataset_builders.get(dataset_name)
+            if builder is None:
+                raise ValueError(f"Unsupported dataset_name: {dataset_name}")
+            dataset = builder()
+            setattr(self, f"{dataset_name.lower()}_dataset", dataset)
+            datasets.append(dataset)
+        return datasets
+
+    def _collect_class_labels(self, data_index, class_pool):
+        excel_id = self.data_list[data_index]['Text']['excel_id']
+        valid_class_label = []
+        for class_n in class_pool:
+            try:
+                if self.G_columns_as_lists[class_n][excel_id] == 1:
+                    valid_class_label.append(class_n)
+            except Exception:
+                pass
+        return valid_class_label
+
+    def _get_primary_class_labels(self, data_index):
+        cached = self._primary_class_cache.get(data_index)
+        if cached is None:
+            cached = self._collect_class_labels(data_index, self.CLASSES_CN)
+            self._primary_class_cache[data_index] = cached
+        return list(cached)
+
+    def _build_filtered_data_indices(self):
+        filtered_indices = list(range(len(self.data_list)))
+        enforce_single_label = self.prompt_mode == 'classification' and self.classification_single_label_only
+        if not self.excluded_classes and not enforce_single_label:
+            return filtered_indices
+
+        kept_indices = []
+        removed_samples = 0
+        unlabeled_samples = 0
+        removed_by_class = Counter()
+        removed_multilabel_samples = 0
+
+        for data_index in filtered_indices:
+            valid_class_label = self._get_primary_class_labels(data_index)
+            if not valid_class_label:
+                unlabeled_samples += 1
+                kept_indices.append(data_index)
+                continue
+
+            matched_classes = sorted(set(valid_class_label) & self.excluded_classes)
+            if matched_classes:
+                removed_samples += 1
+                for class_name in matched_classes:
+                    removed_by_class[class_name] += 1
+                continue
+
+            if enforce_single_label and len(valid_class_label) != 1:
+                removed_multilabel_samples += 1
+                continue
+
+            kept_indices.append(data_index)
+
+        removed_desc = ", ".join(
+            f"{class_name}: {count}"
+            for class_name, count in sorted(removed_by_class.items())
+        ) or "none"
+        print(
+            f"[dataset] {self.Multi_center}/{self.mode}/{self.prompt_mode} "
+            f"exclude_diagnoses={sorted(self.excluded_classes)} "
+            f"single_label_only={enforce_single_label} "
+            f"kept={len(kept_indices)}/{len(filtered_indices)} "
+            f"removed={removed_samples} ({removed_desc}) "
+            f"removed_multilabel={removed_multilabel_samples} "
+            f"unlabeled_kept={unlabeled_samples}"
+        )
+        return kept_indices
 
     def __len__(self):
         if self.prompt_mode == 'classification':
             return len(self.valid_idx)
-        else:
-            return len(self.dataset[0])
+        if self.prompt_mode in self.QUESTION_PROMPT_MODES:
+            return len(self.valid_question_idx)
+        return len(self.filtered_data_idx)
 
+    def _has_usable_modal_images(self, org_images):
+        sax_vision_org = org_images['SAX']
+        fch_vision_org = org_images['FCH']
+        lge_vision_org = org_images['LGE']
+
+        if sax_vision_org is not None and sax_vision_org.size(2) >= 3 and sax_vision_org.size(0) >= 2:
+            return True
+        if fch_vision_org is not None:
+            return True
+        if lge_vision_org is not None:
+            return True
+        return False
 
     def filter_class_label_numpy(self):
         valid_idx = []
-        for data_index, data in enumerate(self.data_list):
-            excel_id =  data['Text']['excel_id'] #G_columns_as_lists[]
-            valid_class_label = []
-            for class_n in CLASSES_CN:
+        removed_missing_modal = 0
+        for data_index in self.filtered_data_idx:
+            valid_class_label = self._get_primary_class_labels(data_index)
+            if not valid_class_label:
+                continue
+            if self.mode != 'train':
                 try:
-                    if self.G_columns_as_lists[class_n][excel_id] == 1:
-                        valid_class_label.append(class_n)
-                except:
-                    pass
-            if len(valid_class_label) > 0:
-                valid_idx.append(data_index)
-                self.data_list[data_index]['classes'] = valid_class_label[0]
-        print(CLASSES_CN)
+                    modal_inputs = self._collect_modal_inputs(data_index)
+                except Exception as exc:
+                    print(f"[dataset] skip idx={data_index} due to modal load error: {exc}")
+                    removed_missing_modal += 1
+                    continue
+                if not self._has_usable_modal_images(modal_inputs['org_images']):
+                    removed_missing_modal += 1
+                    continue
+            valid_idx.append(data_index)
+            self.data_list[data_index]['classes'] = valid_class_label[0]
+        if removed_missing_modal:
+            print(
+                f"[dataset] {self.Multi_center}/{self.mode}/{self.prompt_mode} removed_missing_modal={removed_missing_modal}"
+            )
+        print(self.CLASSES_CN)
         return valid_idx
 
-    def prepare_inputs_img_text(self, input_img_tokens, input_img_patch_indices, input_text,
-                                tokenizer, clinical_infor = '',
-                                question_squeence_list = [3], question_id = 'Question_open', abnormal = ''):
-        end_token = tokenizer.eos_token
+    def filter_class_label_numpy2(self):
+        valid_idx = []
+        for data_index in self.filtered_data_idx:
+            valid_class_label = self._collect_class_labels(data_index, CLASSES_CN_4)
+            if valid_class_label:
+                valid_idx.append(data_index)
+                self.data_list[data_index]['classes2'] = valid_class_label[-1]
+        return valid_idx
 
-        NON_VISION_TOKEN = -1
-        tokens = []
-        attention_masks = []
-        vision_patch_indices = []
-        vision_patches = []
-        labels = []
+    def _question_candidate_ids(self, prompt_mode):
+        if prompt_mode == 'Question_open':
+            if self.Multi_center == 'CD':
+                return [
+                    'Question_open',
+                    'Question_open_R1',
+                    'Question_open',
+                    'Question_open_R1',
+                    'Question_open_no_2',
+                    'Question_open_no_3',
+                ]
+            return ['Question_open', 'Question_open_R1']
+        return ['Question_close', 'Question_close_R1']
 
-        # ---
-        img_tokens = ["<vision>"]
-        cur_patch_indices = [NON_VISION_TOKEN]
-
-        update_patch_indices = [cur_index + len(cur_patch_indices) - cur_patch_indices.count(
-            NON_VISION_TOKEN) if cur_index != NON_VISION_TOKEN else NON_VISION_TOKEN for cur_index in
-                                input_img_patch_indices]
-
-        cur_patch_indices = cur_patch_indices + update_patch_indices  # include the whole <vision>...<vision>
-        img_tokens = img_tokens + input_img_tokens  # all datasets should concat this
-
-        img_tokens.append("/<vision>")
-        cur_patch_indices.append(NON_VISION_TOKEN)
-
-
-        # ---
-        # NOTE tokenizer(xxx) will NOT work here
-        cur_tokens = torch.Tensor(tokenizer.convert_tokens_to_ids(img_tokens))
-        cur_attention_mask = [1] * len(cur_tokens)
-
-        assert len(cur_tokens) == len(cur_patch_indices), f"{len(cur_tokens)} != {len(cur_patch_indices)}"
-
-        tokens.extend(cur_tokens)
-        labels.extend([-100] * len(cur_tokens))
-        attention_masks.extend(cur_attention_mask)
-        vision_patch_indices.extend(cur_patch_indices)
-
-        if self.prompt_mode == 'caption':
-            question = clinical_infor + random.choice(caption_prompt)
-            answer = input_text  # text
-            answer = answer + end_token
-        elif self.prompt_mode == 'report':
-            question = clinical_infor + random.choice(report_prompt)
-            answer = input_text  # text
-            answer = answer + end_token
-        elif self.prompt_mode == 'classification':
-            # question = additional_classification_prompt + '\nQuestion: ' + random.choice(classification_prompt) + '\nAnswer: '
-            question = clinical_infor + additional_classification_prompt_larry + "<CLS>"
-            answer = input_text  # text
-            answer = answer + end_token
-        elif self.prompt_mode == 'Question_open':
-            if question_id == 'Question_open_no_2':
-                QA_list = extract_content(input_text, 4)
-            elif question_id == 'Question_open_no_3':
-                QA_list = extract_content(input_text, 5)
-            else:
-                QA_list = extract_content(input_text, random.choice(question_squeence_list))
-
+    def _available_question_entries(self, excel_id, prompt_mode):
+        available_entries = []
+        for question_id in self._question_candidate_ids(prompt_mode):
+            column = self.G_columns_as_lists.get(question_id)
+            if column is None:
+                continue
             try:
-                if QA_list!= None:
-                    QA = random.choice(QA_list)
-                    Q = 'Question: '+ QA['question']
-                    answer = 'Answer: '+QA['answer'] + end_token
-                    few_shot = 0
-                    if few_shot:
-                        question = clinical_infor + random.choice(question_open_prompt) + "(例如，Question: 左心房大小是否在正常范围内？ Answer: 是，左心房未见增大)" + "\n" + Q
-                    else:
-                        question = clinical_infor + random.choice(question_open_prompt)  + "\n" + Q
-            except:
-                return None
-        # elif question_id == 'Question_open_no_2':
-        #     QA_list = extract_content(input_text, 4)
-        #     try:
-        #         if QA_list!= None:
-        #             QA = random.choice(QA_list)
-        #             Q = 'Question: '+ QA['question']
-        #             answer = 'Answer: '+QA['answer'] + end_token
-        #             few_shot = 0
-        #             if few_shot:
-        #                 question = clinical_infor + random.choice(question_open_prompt) + "(例如，Question: 左心房大小是否在正常范围内？ Answer: 是，左心房未见增大)" + "\n" + Q
-        #             else:
-        #                 question = clinical_infor + random.choice(question_open_prompt)  + "\n" + Q
-        #     except:
-        #         return None
-        # elif question_id == 'Question_open_no_3':
-        #     QA_list = extract_content(input_text, 5)
-        #     try:
-        #         if QA_list!= None:
-        #             QA = random.choice(QA_list)
-        #             Q = 'Question: '+ QA['question']
-        #             answer = 'Answer: '+QA['answer'] + end_token
-        #             few_shot = 0
-        #             if few_shot:
-        #                 question = clinical_infor + random.choice(question_open_prompt) + "(例如，Question: 左心房大小是否在正常范围内？ Answer: 是，左心房未见增大)" + "\n" + Q
-        #             else:
-        #                 question = clinical_infor + random.choice(question_open_prompt)  + "\n" + Q
-        #     except:
-        #         return None
-        elif self.prompt_mode == 'Question_close':
-            QA_list = extract_content_close(input_text, random.choice(question_squeence_list))
-            try:
-                if QA_list!= None:
-                    QA = random.choice(QA_list)
-                    Q = f"Question: {QA['question']} \n"
-                    Q += "Options:"
-                    for letter, content in QA['shuffled_options']:
-                        Q+=f"  {letter}. {content}"
-                    answer = f"Answer: {QA['randanswer_letter']}"  + end_token
-                    question = clinical_infor + random.choice(question_close_prompt) + "\n" + Q
-            except:
-                return None
+                data_str = column[excel_id]
+            except Exception:
+                continue
+            if data_str:
+                available_entries.append((question_id, data_str))
+        return available_entries
 
-        elif self.prompt_mode == 'abnormal_close':
-            question = r'CMR影像中的“{}”是否存在异常？'.format(abnormal)
-            # question = clinical_infor + random.choice(report_prompt)
-            answer = input_text
-            answer = answer + end_token
+    def filter_valid_question_idx(self):
+        valid_idx = []
+        for data_index in self.filtered_data_idx:
+            data = self.data_list[data_index]
+            excel_id = data['Text']['excel_id']
+            if self._available_question_entries(excel_id, self.prompt_mode):
+                valid_idx.append(data_index)
+        print(f"Valid {self.prompt_mode} samples: {len(valid_idx)}")
+        return valid_idx
 
-        # img_tokens.append("<CLS>")
-        # cur_patch_indices.append(NON_VISION_TOKEN)
-        # if self.prompt_mode == 'caption':
-        c_new = tokenizer.bos_token + f"{B_INST} {question.strip()} {E_INST}"
-        _tokenized = tokenizer(c_new, return_tensors="pt", add_special_tokens=False)
-        cur_tokens = _tokenized["input_ids"].squeeze(0)
-        cur_attention_mask = _tokenized["attention_mask"].squeeze(0)
-        tokens.extend(cur_tokens)
-        labels.extend([-100] * len(cur_tokens))
-        attention_masks.extend(cur_attention_mask)
-        vision_patch_indices.extend([NON_VISION_TOKEN] * len(cur_tokens))
-
-
-        if self.mode == 'train':
-            # 不能给classification任务添加answer token，不然会让模型学到answer text token和实际label的关系
-            if self.prompt_mode == 'classification':
-                # random.shuffle(answer)
-                answer = ''+ end_token #str(answer)
-            # print(answer)
-            _tokenized = tokenizer(answer, return_tensors="pt", add_special_tokens=False)
-            cur_tokens = _tokenized["input_ids"].squeeze(0)
-            cur_attention_mask = _tokenized["attention_mask"].squeeze(0)
-            tokens.extend(cur_tokens)
-            labels.extend(cur_tokens)
-            attention_masks.extend(cur_attention_mask)
-            vision_patch_indices.extend([NON_VISION_TOKEN] * len(cur_tokens))
-
-        if len(tokens) > self.max_position_embeddings:
-            tokens = tokens[:self.max_position_embeddings]
-            labels = labels[:self.max_position_embeddings]
-            attention_masks = attention_masks[:self.max_position_embeddings]
-            vision_patch_indices = vision_patch_indices[:self.max_position_embeddings]
-            vision_patches = vision_patches[:self.max_position_embeddings]
-
-        tokens = torch.Tensor(tokens).long()
-        labels = torch.Tensor(labels).long()
-        attention_masks = torch.Tensor(attention_masks).long()
-
-        vision_patch_indices = torch.Tensor(vision_patch_indices).long()
-        return tokens, attention_masks, vision_patch_indices, labels, answer, question
-
-    def __getitem__(self, idx):
-        max_attempts = 10
-        NON_VISION_TOKEN = -1
-        for _ in range(max_attempts):
-            try:
-                if self.prompt_mode == 'classification':
-                    idx = self.valid_idx[idx]
-                    class_label = [self.data_list[idx]['classes']]
-                    valid_class_label = class_label
-
-                vision_tokens = []
-                vision_patch_indices = []
-                input_texts = []
-                # sax_vision_patches = None
-                # fch_vision_patches = None
-                lge_vision_patches = None
-                sax_vision_org = None
-                fch_vision_org = None
-                lge_vision_org = None
-                vision_flag = False
-                question_squeence_list= []
-                for dataset_ind, dataset in enumerate(self.dataset):
-                    # import pdb;pdb.set_trace()
-                    if self.dataset_name[dataset_ind] == 'SAX':
-                        try:
-                            dataset_item = dataset[idx]
-                            # sax_vision_patches = dataset_item['vision_patches']
-                            sax_vision_org = dataset_item['org_image_list']
-                            if sax_vision_org is None:
-                                continue
-                            else:
-                                vision_sax_flag = True
-                                question_squeence_list.append(1)
-                        except:
-                            sax_vision_org = None
-                            continue
-                    if self.dataset_name[dataset_ind] == 'FCH':
-                        try:
-                            dataset_item = dataset[idx]
-                            # fch_vision_patches = dataset_item['vision_patches']
-                            fch_vision_org = dataset_item['org_image']
-                            if fch_vision_org is None:
-                                continue
-                            else:
-                                vision_fch_flag = True
-                                question_squeence_list.append(0)
-                        except:
-                            fch_vision_org = None
-                            continue
-                    if self.dataset_name[dataset_ind] == 'LGE':
-                        try:
-                            dataset_item = dataset[idx]
-                            lge_vision_org = dataset_item['org_image']
-                            if lge_vision_org is None:
-                                continue
-                            else:
-                                vision_lge_flag = True
-                                question_squeence_list.append(2)
-                        except:
-                            lge_vision_org = None
-                            continue
-
-                    vision_tokens.extend(dataset_item["input_ids"])
-                    update_patch_indices = [cur_index + len(vision_patch_indices) - vision_patch_indices.count(
-                        NON_VISION_TOKEN) if cur_index != NON_VISION_TOKEN else NON_VISION_TOKEN for cur_index in
-                                            dataset_item['vision_patch_indices']]
-                    vision_patch_indices.extend(update_patch_indices)
-                    input_texts.append(dataset_item['text'])
-
-
-                input_texts = '\n'.join(input_texts)
-                # if self.use_numpy:
-                balance_loss = 1
-
-                clinical_infor = ''
-                if self.Multi_center in ['KM','CD','SCS']:
-                    clinical_infor = '临床信息: '
-                    excel_id = self.data_list[idx]['Text']['excel_id']
-                    def _safe_get(key):
-                        col = self.G_columns_as_lists.get(key)
-                        if col is None:
-                            return None
-                        try:
-                            return col[excel_id]
-                        except Exception:
-                            return None
-                    B = _safe_get('性别')
-                    if B is not None:
-                        clinical_infor += '性别: ' + str(B)
-                    C = _safe_get('年龄')
-                    if C is not None:
-                        clinical_infor += ' | '+ '年龄: ' + str(C)
-                    if self.Multi_center == 'KM':
-                        A = _safe_get('临床诊断C')
-                        if A is not None:
-                            clinical_infor += ' | '+ '临床信息: '+str(A)
-                    clinical_infor += '\n'
-
-
-                if self.prompt_mode == 'caption':
-                    tokens, attention_masks, patch_indices, labels, answer, question = self.prepare_inputs_img_text(
-                        vision_tokens, vision_patch_indices, input_texts, self.tokenizer, clinical_infor)
-                    class_label = 'None'
-                elif self.prompt_mode == 'report':
-                    excel_id = self.data_list[idx]['Text']['excel_id']
-                    input_texts_org = None
-                    col = self.G_columns_as_lists.get('Trans_3')
-                    if col is not None:
-                        try:
-                            input_texts_org = col[excel_id]
-                        except Exception:
-                            input_texts_org = None
-                    if input_texts_org is not None:
-                        input_texts_json = json.loads(input_texts_org)
-                        input_texts_4CH = "，".join(input_texts_json["1.心脏结构"])
-                        cardiac_function = input_texts_json.get("2.心脏运动及功能") or input_texts_json.get("2.心脏功能")
-                        input_texts_SAX = "，".join(cardiac_function)
-                        input_texts_LGE = "，".join(input_texts_json["3.延迟强化LGE"])
-                        input_texts_other = "，".join(input_texts_json["4.其他影像所见"])
-                        input_texts = ''
-                        if 'FCH' in self.dataset_name:
-                            input_texts += ('心脏结构: ' + input_texts_4CH)
-                        if 'SAX' in self.dataset_name:
-                            input_texts += ('心脏运动及功能: ' + input_texts_SAX)
-                        if 'LGE' in self.dataset_name:
-                            input_texts += ('延迟强化LGE: ' + input_texts_LGE)
-
-                    tokens, attention_masks, patch_indices, labels, answer, question = self.prepare_inputs_img_text(
-                        vision_tokens, vision_patch_indices, input_texts, self.tokenizer, clinical_infor)
-                    class_label = 'None'
-                elif self.prompt_mode == 'Question_open' or self.prompt_mode == 'Question_close':
-                    question_squeence_list = question_squeence_list*5 + [3]
-                    question_id = 'Question_open'
-                    if self.prompt_mode == 'Question_open':
-                        if self.Multi_center == 'CD':
-                            question_id = random.choice(['Question_open', 'Question_open_R1', 'Question_open', 'Question_open_R1', 'Question_open_no_2', 'Question_open_no_3'])
-                            data_str = self.G_columns_as_lists[question_id][self.data_list[idx]['Text']['excel_id']]
-                        else:
-                            question_id = random.choice(['Question_open', 'Question_open_R1'])
-                            data_str = self.G_columns_as_lists[question_id][self.data_list[idx]['Text']['excel_id']]
-                    else:
-                        question_id =random.choice(['Question_close', 'Question_close_R1'])
-                        data_str = self.G_columns_as_lists[question_id][self.data_list[idx]['Text']['excel_id']]
-
-                    # data_str = G_columns_as_lists['Question_close'][self.data_list[idx]['Text']['excel_id']]
-                    tokens, attention_masks, patch_indices, labels, answer, question = self.prepare_inputs_img_text(
-                        vision_tokens, vision_patch_indices, data_str, self.tokenizer, clinical_infor, question_squeence_list, question_id)
-                    class_label = 'None'
-                elif self.prompt_mode == 'abnormal_close':
-                    input_texts_org = self.G_columns_as_lists['Trans_4'][self.data_list[idx]['Text']['excel_id']]
-                    value = -1
-                    for _ in range(5):
-                        try:
-                            if self.mode == 'train':
-                                chinese_name = random.choice(list(name_mapping.keys()))
-                            else:
-                                chinese_name = self.abnormal_name
-                            english_name = name_mapping[chinese_name]
-                            pattern = r'\s*"{}",\s*"abnormal":\s*(true|false)'.format(chinese_name)
-                            match = re.search(pattern, input_texts_org, re.IGNORECASE)  # 忽略大小写
-
-                            if match:
-                                abnormal_value = match.group(1).lower()  # 获取 true/false
-                                if abnormal_value == 'true':
-                                    value = 1
-                                else:
-                                    value = 0
-                            else:
-                                value = -1
-
-                            if value != -1:
-                                break
-                        except:
-                            pass
-
-
-
-                    try:
-                        onehot_label = torch.LongTensor([0] * 2)
-                        if value == 1:
-                            balance_loss = self.weights_df['weight_abnormal'][english_name]
-                            onehot_label[1] = 1
-                        else:
-                            balance_loss = self.weights_df['weight_normal'][english_name]
-                            onehot_label[0] = 1
-                    except:
-                        print(english_name)
-                    input_text= str(value)
-                    tokens, attention_masks, patch_indices, labels, answer, question = self.prepare_inputs_img_text(
-                        vision_tokens, vision_patch_indices, input_text, self.tokenizer, clinical_infor, abnormal=chinese_name)
-                    class_label = onehot_label
-                elif self.prompt_mode == 'classification':
-                    tokens, attention_masks, patch_indices, labels, answer, question = self.prepare_inputs_img_text(
-                        vision_tokens, vision_patch_indices, '', self.tokenizer, clinical_infor)
-
-                ret = {
-                    "input_ids": tokens,
-                    "attention_mask": attention_masks,
-                    "vision_patch_indices": patch_indices,
-                    "labels": labels,
-                    "class_label": class_label,
-                    "balance_loss":balance_loss
-                }
-
-                if sax_vision_org is not None:
-                    if sax_vision_org.size(2)<3 or sax_vision_org.size(0)<2:
-                        if self.prompt_mode == 'classification':
-                            idx = random.randint(0, len(self.valid_idx) - 1)
-                        else:
-                            idx = random.randint(0, len(self.dataset[0]) - 1)
-                        continue
-                    else:
-                        ret['sax_vision_org_0'] = sax_vision_org.bfloat16()
-                # if sax_vision_org is not None:
-                #     # ret['sax_vision_patches'] = sax_vision_patches
-                #     if len(sax_vision_org) == 1:
-                #         ret['sax_vision_org_0'] = sax_vision_org[0].bfloat16()
-                #     elif len(sax_vision_org) == 2:
-                #         ret['sax_vision_org_0'] = sax_vision_org[0].bfloat16()
-                #         ret['sax_vision_org_1'] = sax_vision_org[1].bfloat16()
-                #     elif len(sax_vision_org) == 3:
-                #         ret['sax_vision_org_0'] = sax_vision_org[0].bfloat16()
-                #         ret['sax_vision_org_1'] = sax_vision_org[1].bfloat16()
-                #         ret['sax_vision_org_2'] = sax_vision_org[2].bfloat16()
-                #     else:
-                #         pass
-
-
-
-                if fch_vision_org is not None:
-                    ret['fch_vision_org'] = fch_vision_org.bfloat16()
-
-                # if fch_vision_patches is not None:
-                #     ret['fch_vision_patches'] = fch_vision_patches
-                if lge_vision_org is not None:
-                    ret['lge_vision_org'] = lge_vision_org.bfloat16()
-
-
-
-                if self.mode == 'test':
-                    if question is None:
-                        ret['question'] = ''
-                    else:
-                        ret['question'] = question
-                    if answer is None:
-                        ret['text'] = ''
-                    else:
-                        ret['text'] = answer
-                        # print(answer)
-                if self.prompt_mode == 'classification':
-                    onehot_label = torch.LongTensor([0] * self.n_class)
-                    for class_n in valid_class_label:
-                        if self.n_class == 2:
-                            class_ind = CLASSES_CN.index(class_n)
-                            if class_ind == CLASSES_CN.index('Normal'):
-                                onehot_label[0] = 1
-                            else:
-                                onehot_label[1] = 1
-                        else:
-                            class_ind = CLASSES_CN.index(class_n)
-                            onehot_label[class_ind] = 1
-                    if self.n_class == 2 and onehot_label[0] == 1 and onehot_label[1] == 1:
-                        onehot_label[0] = 0
-                    ret['class_label'] = onehot_label
-                    ret['multilabel'] = self.multilabel
-                return ret
-            except Exception as e:
-                print(f"Error in __getitem__ at index : {e}")
-                if self.prompt_mode == 'classification':
-                    idx = random.randint(0, len(self.valid_idx) - 1)
-                else:
-                    idx = random.randint(0, len(self.dataset[0]) - 1)
-
-class UniDatasets_tsvlge_ALL2(Dataset):
-    def __init__(self, args, tokenizer, mode="train", dataset_names=['FCH', 'SAX', 'LGE'], prompt_mode='classification',
-                 n_class=7, multilabel=False, use_seg=True, use_numpy = False, use_det = False, Multi_center = 'KM',
-                 abnormal_name= 'LVEDD'):
-        super(UniDatasets_tsvlge_ALL2, self).__init__()
-        self.tokenizer = tokenizer
-        self.args = args
-        self.mode = mode
-        self.Multi_center = Multi_center
-        print()
-        if Multi_center == 'KM':
-            with open(args.all_data_path, 'r') as file:
-                self.json_file = json.load(file)
-            self.G_columns_as_lists = G_KM_columns_as_lists
-            self.data_all_root = {
-                'image': args.data_root,
-                'LV_mask': args.seg_Lv_root,
-                'RV_mask': args.seg_Rv_root,
-                'MYO_mask': args.seg_MYO_root,
-                'DET_mask': args.det_km_root,
-            }
-            self.weights_df = calculate_cardiac_weights(KM_excel_path)
-        elif Multi_center == 'SCS':
-            with open(args.scs_data_path, 'r') as file:
-                self.json_file = json.load(file)
-            self.G_columns_as_lists = G_SCS_columns_as_lists
-            self.data_all_root = {
-                'image': args.scs_root,
-                'LV_mask': args.seg_scs_Lv_root,
-                'RV_mask': args.seg_scs_Rv_root,
-                'MYO_mask': args.seg_scs_MYO_root,
-                'DET_mask': args.det_scs_root,
-            }
-            self.weights_df = calculate_cardiac_weights(SCS_excel_path)
-        elif Multi_center == 'CD':
-            with open(args.cd_data_path, 'r') as file:
-                self.json_file = json.load(file)
-            self.G_columns_as_lists = G_CD_columns_as_lists
-            self.data_all_root = {
-                'image': args.cd_root,
-                'LV_mask': args.seg_cd_Lv_root,
-                'RV_mask': args.seg_cd_Rv_root,
-                'MYO_mask': args.seg_cd_MYO_root,
-                'DET_mask': args.det_cd_root,
-            }
-            self.weights_df = calculate_cardiac_weights(CD_excel_path)
-        elif Multi_center == 'NCSD':
-            with open(args.location_data_path3D, 'r') as file:
-                self.json_file = json.load(file)
-            self.data_all_root = {
-                'image': args.data_root,
-                'LV_mask': args.seg_cd_Lv_root,#!
-                'RV_mask': args.seg_cd_Rv_root,
-                'MYO_mask': args.seg_cd_MYO_root,
-            }
-        self.data_list = self.json_file[mode]
-        self.dataset = []
-        self.dataset_name = dataset_names
-        self.n_class = n_class
-        print(f'Number class: ' + str(self.n_class))
-        self.multilabel = multilabel
-        self.use_seg = use_seg
-        self.use_numpy = use_numpy
-        self.use_det = use_det
-        for dataset_name in dataset_names:
-            if dataset_name == 'SAX':
-                self.sax_dataset = SAXCineDataset_CMR_3DFilm_vst_ALL(self.args, self.data_all_root, self.tokenizer,
-                                                                 self.json_file, self.G_columns_as_lists, self.mode,
-                                                                 use_seg=self.use_seg, use_numpy = self.use_numpy, use_det =  self.use_det)
-                self.dataset.append(self.sax_dataset)
-            if dataset_name == 'FCH':
-                self.fch_dataset = FCHCineDataset_CMR_2DFilm_vst(self.args, self.data_all_root, self.tokenizer,
-                                                                 self.json_file, self.G_columns_as_lists,self.mode,
-                                                                 use_numpy = self.use_numpy)  # 4CH
-                self.dataset.append(self.fch_dataset)
-            if dataset_name == 'LGE':
-                self.lge_dataset = LGEDataset_CMR_3D_vst(self.args, self.data_all_root, self.tokenizer,
-                                                        self.json_file, self.G_columns_as_lists,self.mode,
-                                                        use_seg=self.use_seg, use_numpy = self.use_numpy, use_det = self.use_det)
-                self.dataset.append(self.lge_dataset)
-
-        self.max_position_embeddings = 4096
-        self.prompt_mode = prompt_mode
-        self.abnormal_name =abnormal_name
-        if self.prompt_mode == 'classification':
-            self.valid_idx = self.filter_class_label_numpy()
-        self.filter_class_label_numpy2()
-        if self.prompt_mode == 'mace':
-            self._preprocess_survival_data()
-        # self.collect_center_abnormal_class_stats()
-
-    def __len__(self):
-        if self.prompt_mode == 'classification':
-            return len(self.valid_idx)
-        else:
-            return len(self.dataset[0])
+    def _sample_question_entry(self, excel_id, prompt_mode):
+        available_entries = self._available_question_entries(excel_id, prompt_mode)
+        if not available_entries:
+            raise KeyError(
+                f"missing question data for prompt_mode={prompt_mode}, "
+                f"center={self.Multi_center}, excel_id={excel_id}"
+            )
+        return random.choice(available_entries)
 
     def _preprocess_survival_data(self):
-        """预处理生存分析数据，统一处理所有数据后再分训练/测试集"""
-        # 合并训练集和测试集数据
         all_data = self.json_file['train'] + self.json_file['test']
-
-        # 1. 收集所有有效随访时间
         valid_times = []
         for item in all_data:
             mace_time = item['Text'].get('mace_time')
             if not pd.isna(mace_time) and mace_time is not None:
                 valid_times.append(mace_time)
 
-        if len(valid_times) == 0:
+        if not valid_times:
             raise ValueError("没有有效的随访时间数据可用于生存分析")
 
-        # 2. 计算全局时间分桶（基于所有数据）
         self.global_time_bins = np.quantile(valid_times, np.linspace(0, 1, 10))
         self.global_time_bins = np.unique(self.global_time_bins)
-
-        # 处理特殊情况（如所有时间相同）
         if len(self.global_time_bins) < 2:
-            max_time = max(valid_times)
-            self.global_time_bins = np.linspace(0, max_time, 10)
+            self.global_time_bins = np.linspace(0, max(valid_times), 10)
 
-        # 3. 计算全局中位数用于填充NaN
         self.global_median_time = np.median(valid_times)
-
         print(f"全局时间分桶: {self.global_time_bins}")
         print(f"全局中位数时间: {self.global_median_time}")
 
-        # 4. 为当前模式（train/test）创建标签
         self._create_survival_labels_for_current_mode()
 
     def _create_survival_labels_for_current_mode(self):
-        """为当前数据集模式（train/test）创建生存标签"""
         self.survival_labels = []
         self.valid_indices = []
 
         event_count = 0
         total_count = len(self.data_list)
-
         for idx, item in enumerate(self.data_list):
             time = item['Text'].get('mace_time')
-            event = item['Text'].get('mace_cls', 0)  # 默认为0（未发生事件）
+            event = item['Text'].get('mace_cls', 0)
 
-            # 填充NaN值
             if pd.isna(time) or time is None:
                 time = self.global_median_time
 
-            # 创建时间区间标签
             bin_labels = []
             for bin_time in self.global_time_bins:
                 if time >= bin_time:
-                    bin_labels.append(1.0)  # 生存到该时间
+                    bin_labels.append(1.0)
                 elif event == 1 and time < bin_time:
-                    bin_labels.append(0.0)  # 在该时间前发生事件
+                    bin_labels.append(0.0)
                     event_count += 1
                 else:
-                    bin_labels.append(1.0)  # 删失数据
+                    bin_labels.append(1.0)
 
             self.survival_labels.append(bin_labels)
             self.valid_indices.append(idx)
 
         self.survival_labels = np.array(self.survival_labels)
-
-        print(f"{self.mode}集 - 总样本数: {total_count} "
-              f"事件数: {event_count} "
-              f"事件率: {event_count / total_count:.2%}")
-    def filter_class_label_numpy2(self):
-        valid_idx = []
-        for data_index, data in enumerate(self.data_list):
-            excel_id =  data['Text']['excel_id'] #G_columns_as_lists[]
-            valid_class_label = []
-            for class_n in CLASSES_CN_4:
-                try:
-                    if self.G_columns_as_lists[class_n][excel_id] == 1:
-                        valid_class_label.append(class_n)
-                except:
-                    pass
-            if len(valid_class_label) > 0:
-                valid_idx.append(data_index)
-                self.data_list[data_index]['classes2'] = valid_class_label[-1]
-        print(CLASSES_CN)
-        return valid_idx
-
-    def filter_class_label_numpy(self):
-        valid_idx = []
-        for data_index, data in enumerate(self.data_list):
-            excel_id =  data['Text']['excel_id'] #G_columns_as_lists[]
-            valid_class_label = []
-            for class_n in CLASSES_CN:
-                try:
-                    if self.G_columns_as_lists[class_n][excel_id] == 1:
-                        valid_class_label.append(class_n)
-                except:
-                    pass
-            if len(valid_class_label) > 0:
-                valid_idx.append(data_index)
-                self.data_list[data_index]['classes'] = valid_class_label[0]
-        print(CLASSES_CN)
-        return valid_idx
+        print(
+            f"{self.mode}集 - 总样本数: {total_count} "
+            f"事件数: {event_count} "
+            f"事件率: {event_count / total_count:.2%}"
+        )
 
     def prepare_inputs_img_text(self, input_img_tokens, input_img_patch_indices, input_text,
-                                tokenizer, clinical_infor = '',
-                                question_squeence_list = [3], question_id = 'Question_open', abnormal = ''):
+                                tokenizer, clinical_infor='', question_squeence_list=None,
+                                question_id='Question_open', abnormal=''):
         end_token = tokenizer.eos_token
+        question_squeence_list = question_squeence_list or [3]
 
         NON_VISION_TOKEN = -1
         tokens = []
         attention_masks = []
         vision_patch_indices = []
-        vision_patches = []
         labels = []
 
-        # ---
         img_tokens = ["<vision>"]
         cur_patch_indices = [NON_VISION_TOKEN]
-
-        update_patch_indices = [cur_index + len(cur_patch_indices) - cur_patch_indices.count(
-            NON_VISION_TOKEN) if cur_index != NON_VISION_TOKEN else NON_VISION_TOKEN for cur_index in
-                                input_img_patch_indices]
-
-        cur_patch_indices = cur_patch_indices + update_patch_indices  # include the whole <vision>...<vision>
-        img_tokens = img_tokens + input_img_tokens  # all datasets should concat this
-
+        update_patch_indices = [
+            cur_index + len(cur_patch_indices) - cur_patch_indices.count(NON_VISION_TOKEN)
+            if cur_index != NON_VISION_TOKEN else NON_VISION_TOKEN
+            for cur_index in input_img_patch_indices
+        ]
+        cur_patch_indices = cur_patch_indices + update_patch_indices
+        img_tokens = img_tokens + input_img_tokens
         img_tokens.append("/<vision>")
         cur_patch_indices.append(NON_VISION_TOKEN)
 
-
-        # ---
-        # NOTE tokenizer(xxx) will NOT work here
         cur_tokens = torch.Tensor(tokenizer.convert_tokens_to_ids(img_tokens))
         cur_attention_mask = [1] * len(cur_tokens)
-
         assert len(cur_tokens) == len(cur_patch_indices), f"{len(cur_tokens)} != {len(cur_patch_indices)}"
 
         tokens.extend(cur_tokens)
@@ -6243,13 +6139,10 @@ class UniDatasets_tsvlge_ALL2(Dataset):
             answer = input_text + end_token
         elif self.prompt_mode == 'report':
             question = clinical_infor + random.choice(report_prompt)
-            answer = input_text  # text
-            answer = answer + end_token
+            answer = input_text + end_token
         elif self.prompt_mode == 'classification':
-            # question = additional_classification_prompt + '\nQuestion: ' + random.choice(classification_prompt) + '\nAnswer: '
             question = clinical_infor + additional_classification_prompt_larry + "<CLS>"
-            answer = input_text  # text
-            answer = answer + end_token
+            answer = input_text + end_token
         elif self.prompt_mode == 'Question_open':
             if question_id == 'Question_open_no_2':
                 QA_list = extract_content(input_text, 4)
@@ -6258,42 +6151,29 @@ class UniDatasets_tsvlge_ALL2(Dataset):
             else:
                 QA_list = extract_content(input_text, random.choice(question_squeence_list))
 
-            try:
-                if QA_list!= None:
-                    QA = random.choice(QA_list)
-                    Q = 'Question: '+ QA['question']
-                    answer = 'Answer: '+QA['answer'] + end_token
-                    few_shot = 0
-                    if few_shot:
-                        question = clinical_infor + random.choice(question_open_prompt) + "(例如，Question: 左心房大小是否在正常范围内？ Answer: 是，左心房未见增大)" + "\n" + Q
-                    else:
-                        question = clinical_infor + random.choice(question_open_prompt)  + "\n" + Q
-            except:
-                return None
-
+            if not QA_list:
+                raise ValueError(f"failed to parse open question for {question_id}")
+            QA = random.choice(QA_list)
+            Q = 'Question: ' + QA['question']
+            answer = 'Answer: ' + QA['answer'] + end_token
+            question = clinical_infor + random.choice(question_open_prompt) + "\n" + Q
         elif self.prompt_mode == 'Question_close':
             QA_list = extract_content_close(input_text, random.choice(question_squeence_list))
-            try:
-                if QA_list!= None:
-                    QA = random.choice(QA_list)
-                    Q = f"Question: {QA['question']} \n"
-                    Q += "Options:"
-                    for letter, content in QA['shuffled_options']:
-                        Q+=f"  {letter}. {content}"
-                    answer = f"Answer: {QA['randanswer_letter']}"  + end_token
-                    question = clinical_infor + random.choice(question_close_prompt) + "\n" + Q
-            except:
-                return None
-
+            if not QA_list:
+                raise ValueError("failed to parse close question")
+            QA = random.choice(QA_list)
+            Q = f"Question: {QA['question']} \n"
+            Q += "Options:"
+            for letter, content in QA['shuffled_options']:
+                Q += f"  {letter}. {content}"
+            answer = f"Answer: {QA['randanswer_letter']}" + end_token
+            question = clinical_infor + random.choice(question_close_prompt) + "\n" + Q
         elif self.prompt_mode == 'abnormal_close':
             question = r'CMR影像中的“{}”是否存在异常？'.format(abnormal)
-            # question = clinical_infor + random.choice(report_prompt)
-            answer = input_text
-            answer = answer + end_token
+            answer = input_text + end_token
+        else:
+            raise ValueError(f"Unsupported prompt_mode: {self.prompt_mode}")
 
-        # img_tokens.append("<CLS>")
-        # cur_patch_indices.append(NON_VISION_TOKEN)
-        # if self.prompt_mode == 'caption':
         c_new = tokenizer.bos_token + f"{B_INST} {question.strip()} {E_INST}"
         _tokenized = tokenizer(c_new, return_tensors="pt", add_special_tokens=False)
         cur_tokens = _tokenized["input_ids"].squeeze(0)
@@ -6303,13 +6183,9 @@ class UniDatasets_tsvlge_ALL2(Dataset):
         attention_masks.extend(cur_attention_mask)
         vision_patch_indices.extend([NON_VISION_TOKEN] * len(cur_tokens))
 
-
         if self.mode == 'train':
-            # 不能给classification任务添加answer token，不然会让模型学到answer text token和实际label的关系
             if self.prompt_mode == 'classification':
-                # random.shuffle(answer)
-                answer = ''+ end_token #str(answer)
-            # print(answer)
+                answer = '' + end_token
             _tokenized = tokenizer(answer, return_tensors="pt", add_special_tokens=False)
             cur_tokens = _tokenized["input_ids"].squeeze(0)
             cur_attention_mask = _tokenized["attention_mask"].squeeze(0)
@@ -6323,68 +6199,243 @@ class UniDatasets_tsvlge_ALL2(Dataset):
             labels = labels[:self.max_position_embeddings]
             attention_masks = attention_masks[:self.max_position_embeddings]
             vision_patch_indices = vision_patch_indices[:self.max_position_embeddings]
-            vision_patches = vision_patches[:self.max_position_embeddings]
 
         tokens = torch.Tensor(tokens).long()
         labels = torch.Tensor(labels).long()
         attention_masks = torch.Tensor(attention_masks).long()
-
         vision_patch_indices = torch.Tensor(vision_patch_indices).long()
         return tokens, attention_masks, vision_patch_indices, labels, answer, question
 
-    def collect_center_abnormal_class_stats(self):
-        """
-        Collect actual statistics of abnormalities and classifications for each center.
-        Returns:
-            tuple: (center_abnormal_counts, abnormal_class_counts)
-        """
-        # Initialize counters
-        center_abnormal_counts = {}  # (center, abnormal) -> count
-        abnormal_class_counts = {}  # (abnormal, class) -> count
+    def _safe_get_column_value(self, excel_id, key):
+        column = getattr(self, "G_columns_as_lists", {}).get(key)
+        if column is None:
+            return None
+        try:
+            return column[excel_id]
+        except Exception:
+            return None
 
-        # Traverse the dataset
-        for idx in range(len(self.data_list)):
+    def _build_clinical_info(self, excel_id):
+        if self.Multi_center not in self.CLINICAL_INFO_CENTERS:
+            return ''
+
+        clinical_infor = '临床信息: '
+        gender = self._safe_get_column_value(excel_id, '性别')
+        if gender is not None:
+            clinical_infor += '性别: ' + str(gender)
+
+        age = self._safe_get_column_value(excel_id, '年龄')
+        if age is not None:
+            clinical_infor += ' | ' + '年龄: ' + str(age)
+
+        if self.Multi_center == 'KM' and self.prompt_mode not in self.KM_DIAGNOSIS_EXCLUDED_PROMPTS:
+            diagnosis = self._safe_get_column_value(excel_id, '临床诊断C')
+            if diagnosis is not None:
+                clinical_infor += ' | ' + '临床信息: ' + str(diagnosis)
+
+        clinical_infor += '\n'
+        return clinical_infor
+
+    def _build_report_text(self, excel_id, default_text):
+        input_texts_org = self._safe_get_column_value(excel_id, 'Trans_3')
+        if input_texts_org is None:
+            return default_text
+
+        try:
+            input_texts_json = json.loads(input_texts_org)
+            input_texts_4CH = "，".join(input_texts_json["1.心脏结构"])
+            cardiac_function = input_texts_json.get("2.心脏运动及功能") or input_texts_json.get("2.心脏功能")
+            input_texts_SAX = "，".join(cardiac_function)
+            input_texts_LGE = "，".join(input_texts_json["3.延迟强化LGE"])
+        except Exception:
+            return default_text
+
+        report_text = ''
+        if 'FCH' in self.dataset_name:
+            report_text += '心脏结构: ' + input_texts_4CH
+        if 'SAX' in self.dataset_name:
+            report_text += '心脏运动及功能: ' + input_texts_SAX
+        if 'LGE' in self.dataset_name:
+            report_text += '延迟强化LGE: ' + input_texts_LGE
+        return report_text
+
+    def _collect_modal_inputs(self, idx):
+        NON_VISION_TOKEN = -1
+        vision_tokens = []
+        vision_patch_indices = []
+        input_texts = []
+        question_squeence_list = []
+        org_images = {'SAX': None, 'FCH': None, 'LGE': None}
+        org_image_keys = {'SAX': 'org_image_list', 'FCH': 'org_image', 'LGE': 'org_image'}
+        question_orders = {'FCH': 0, 'SAX': 1, 'LGE': 2}
+
+        for dataset_name, dataset in zip(self.dataset_name, self.dataset):
             try:
-                # Get center
-                center = self.Multi_center
+                dataset_item = dataset[idx]
+            except Exception:
+                continue
 
-                # Get abnormalities from Trans_4 field
+            org_image = dataset_item.get(org_image_keys[dataset_name])
+            if org_image is None:
+                continue
+
+            org_images[dataset_name] = org_image
+            question_squeence_list.append(question_orders[dataset_name])
+
+            vision_tokens.extend(dataset_item["input_ids"])
+            update_patch_indices = [
+                cur_index + len(vision_patch_indices) - vision_patch_indices.count(NON_VISION_TOKEN)
+                if cur_index != NON_VISION_TOKEN else NON_VISION_TOKEN
+                for cur_index in dataset_item['vision_patch_indices']
+            ]
+            vision_patch_indices.extend(update_patch_indices)
+            input_texts.append(dataset_item['text'])
+
+        return {
+            'vision_tokens': vision_tokens,
+            'vision_patch_indices': vision_patch_indices,
+            'input_texts': '\n'.join(input_texts),
+            'question_squeence_list': question_squeence_list,
+            'org_images': org_images,
+        }
+
+    def _resolve_sample_index(self, idx):
+        if self.prompt_mode == 'classification':
+            data_idx = self.valid_idx[idx]
+            valid_class_label = [self.data_list[data_idx]['classes']]
+            return data_idx, valid_class_label
+        if self.prompt_mode in self.QUESTION_PROMPT_MODES:
+            return self.valid_question_idx[idx], None
+        return self.filtered_data_idx[idx], None
+
+    def _retry_idx(self):
+        if self.prompt_mode == 'classification':
+            return random.randint(0, len(self.valid_idx) - 1)
+        if self.prompt_mode in self.QUESTION_PROMPT_MODES:
+            return random.randint(0, len(self.valid_question_idx) - 1)
+        return random.randint(0, len(self.filtered_data_idx) - 1)
+
+    def _build_abnormal_close(self, excel_id, vision_tokens, vision_patch_indices, clinical_infor):
+        input_texts_org = self._safe_get_column_value(excel_id, 'Trans_4')
+        if input_texts_org is None:
+            raise KeyError(f"missing Trans_4 for center={self.Multi_center}, excel_id={excel_id}")
+
+        value = -1
+        english_name = None
+        chinese_name = None
+        for _ in range(5):
+            if self.mode == 'train':
+                chinese_name = random.choice(list(name_mapping.keys()))
+            else:
+                chinese_name = self.abnormal_name
+            english_name = name_mapping[chinese_name]
+            pattern = r'\s*"{}",\s*"abnormal":\s*(true|false)'.format(chinese_name)
+            match = re.search(pattern, input_texts_org, re.IGNORECASE)
+            if not match:
+                continue
+            value = 1 if match.group(1).lower() == 'true' else 0
+            break
+
+        if value == -1:
+            raise ValueError(f"failed to parse abnormal label for center={self.Multi_center}, excel_id={excel_id}")
+
+        onehot_label = torch.LongTensor([0] * 2)
+        balance_loss = 1
+        if hasattr(self, 'weights_df') and english_name is not None:
+            if value == 1:
+                balance_loss = self.weights_df['weight_abnormal'][english_name]
+                onehot_label[1] = 1
+            else:
+                balance_loss = self.weights_df['weight_normal'][english_name]
+                onehot_label[0] = 1
+        elif value == 1:
+            onehot_label[1] = 1
+        else:
+            onehot_label[0] = 1
+
+        tokens, attention_masks, patch_indices, labels, answer, question = self.prepare_inputs_img_text(
+            vision_tokens, vision_patch_indices, str(value), self.tokenizer, clinical_infor, abnormal=chinese_name
+        )
+        return tokens, attention_masks, patch_indices, labels, answer, question, onehot_label, balance_loss
+
+    def _build_mace_sample(self, data_idx, vision_tokens, vision_patch_indices, clinical_infor):
+        mace_status = self.data_list[data_idx]['Text'].get('mace_cls', 0)
+        survival_time = self.data_list[data_idx]['Text'].get('mace_time', 0)
+        if pd.isna(survival_time):
+            survival_time = getattr(self, 'global_median_time', 0)
+
+        answer = f"MACE状态: {'阳性' if mace_status == 1 else '阴性'}, 随访时间: {survival_time}天"
+        return self.prepare_inputs_img_text(
+            vision_tokens, vision_patch_indices, answer, self.tokenizer, clinical_infor
+        )
+
+    def _build_classification_onehot(self, valid_class_label):
+        onehot_label = torch.LongTensor([0] * self.n_class)
+        normal_label = next((label for label in self.NORMAL_CLASS_ALIASES if label in self.CLASSES_CN), self.CLASSES_CN[0])
+
+        for class_n in valid_class_label:
+            try:
+                if self.n_class == 2:
+                    if class_n == normal_label:
+                        onehot_label[0] = 1
+                    else:
+                        onehot_label[1] = 1
+                else:
+                    class_ind = self.CLASSES_CN.index(class_n)
+                    onehot_label[class_ind] = 1
+            except ValueError:
+                continue
+
+        if self.n_class == 2 and onehot_label[0] == 1 and onehot_label[1] == 1:
+            onehot_label[0] = 0
+        return onehot_label
+
+    def _attach_modal_images(self, ret, org_images):
+        sax_vision_org = org_images['SAX']
+        fch_vision_org = org_images['FCH']
+        lge_vision_org = org_images['LGE']
+        attached_any = False
+
+        if sax_vision_org is not None:
+            if sax_vision_org.size(2) >= 3 and sax_vision_org.size(0) >= 2:
+                ret['sax_vision_org_0'] = sax_vision_org.bfloat16()
+                attached_any = True
+        if fch_vision_org is not None:
+            ret['fch_vision_org'] = fch_vision_org.bfloat16()
+            attached_any = True
+        if lge_vision_org is not None:
+            ret['lge_vision_org'] = lge_vision_org.bfloat16()
+            attached_any = True
+        return attached_any
+
+    def collect_center_abnormal_class_stats(self):
+        center_abnormal_counts = {}
+        abnormal_class_counts = {}
+
+        for idx in self.filtered_data_idx:
+            data = self.data_list[idx]
+            try:
+                excel_id = data['Text']['excel_id']
+                input_texts_org = self._safe_get_column_value(excel_id, 'Trans_4')
+                if not input_texts_org:
+                    continue
+
                 abnormalities = set()
-                excel_id = self.data_list[idx]['Text']['excel_id']
-                input_texts_org = self.G_columns_as_lists['Trans_4'][excel_id]
-
-                # Use the same matching logic as in __getitem__
                 for chinese_name in name_mapping.keys():
                     pattern = r'\s*"{}",\s*"abnormal":\s*(true|false)'.format(chinese_name)
                     match = re.search(pattern, input_texts_org, re.IGNORECASE)
-                    if match:
-                        abnormal_value = match.group(1).lower()
-                        if abnormal_value == 'true':
-                            abnormalities.add(chinese_name)
+                    if match and match.group(1).lower() == 'true':
+                        abnormalities.add(chinese_name)
 
-                # Get classifications
-                classifications = set()
+                class_name = data.get('classes2') or data.get('classes')
+                classifications = {class_name} if class_name else set()
 
-
-                class_label = [self.data_list[idx]['classes2']]
-                for class_n in class_label:
-                    try:
-                        class_ind = CLASSES_CN_4.index(class_n)
-                        classifications.add(class_n)
-                    except ValueError:
-                        continue
-
-                # Update counts
                 for abnormal in abnormalities:
-                    # Center -> Abnormal
-                    key = (center, abnormal)
-                    center_abnormal_counts[key] = center_abnormal_counts.get(key, 0) + 1
-
-                    # Abnormal -> Class
+                    center_key = (self.Multi_center, abnormal)
+                    center_abnormal_counts[center_key] = center_abnormal_counts.get(center_key, 0) + 1
                     for cls in classifications:
-                        key = (abnormal, cls)
-                        abnormal_class_counts[key] = abnormal_class_counts.get(key, 0) + 1
-
+                        class_key = (abnormal, cls)
+                        abnormal_class_counts[class_key] = abnormal_class_counts.get(class_key, 0) + 1
             except Exception as e:
                 print(f"Error processing item {idx}: {e}")
                 continue
@@ -6393,778 +6444,54 @@ class UniDatasets_tsvlge_ALL2(Dataset):
 
     def __getitem__(self, idx):
         max_attempts = 10
-        NON_VISION_TOKEN = -1
+        last_error = None
+        original_idx = idx
         for _ in range(max_attempts):
             try:
-                if self.prompt_mode == 'classification':
-                    idx = self.valid_idx[idx]
-                    class_label = [self.data_list[idx]['classes']]
-                    valid_class_label = class_label
+                data_idx, valid_class_label = self._resolve_sample_index(idx)
+                modal_inputs = self._collect_modal_inputs(data_idx)
+                vision_tokens = modal_inputs['vision_tokens']
+                vision_patch_indices = modal_inputs['vision_patch_indices']
+                input_texts = modal_inputs['input_texts']
+                question_squeence_list = modal_inputs['question_squeence_list']
+                org_images = modal_inputs['org_images']
 
-                vision_tokens = []
-                vision_patch_indices = []
-                input_texts = []
-                # sax_vision_patches = None
-                # fch_vision_patches = None
-                lge_vision_patches = None
-                sax_vision_org = None
-                fch_vision_org = None
-                lge_vision_org = None
-                vision_flag = False
-                question_squeence_list= []
-                for dataset_ind, dataset in enumerate(self.dataset):
-                    # import pdb;pdb.set_trace()
-                    if self.dataset_name[dataset_ind] == 'SAX':
-                        try:
-                            dataset_item = dataset[idx]
-                            # sax_vision_patches = dataset_item['vision_patches']
-                            sax_vision_org = dataset_item['org_image_list']
-                            if sax_vision_org is None:
-                                continue
-                            else:
-                                vision_sax_flag = True
-                                question_squeence_list.append(1)
-                        except:
-                            sax_vision_org = None
-                            continue
-                    if self.dataset_name[dataset_ind] == 'FCH':
-                        try:
-                            dataset_item = dataset[idx]
-                            # fch_vision_patches = dataset_item['vision_patches']
-                            fch_vision_org = dataset_item['org_image']
-                            if fch_vision_org is None:
-                                continue
-                            else:
-                                vision_fch_flag = True
-                                question_squeence_list.append(0)
-                        except:
-                            fch_vision_org = None
-                            continue
-                    if self.dataset_name[dataset_ind] == 'LGE':
-                        try:
-                            dataset_item = dataset[idx]
-                            lge_vision_org = dataset_item['org_image']
-                            if lge_vision_org is None:
-                                continue
-                            else:
-                                vision_lge_flag = True
-                                question_squeence_list.append(2)
-                        except:
-                            lge_vision_org = None
-                            continue
-
-                    vision_tokens.extend(dataset_item["input_ids"])
-                    update_patch_indices = [cur_index + len(vision_patch_indices) - vision_patch_indices.count(
-                        NON_VISION_TOKEN) if cur_index != NON_VISION_TOKEN else NON_VISION_TOKEN for cur_index in
-                                            dataset_item['vision_patch_indices']]
-                    vision_patch_indices.extend(update_patch_indices)
-                    input_texts.append(dataset_item['text'])
-
-
-                input_texts = '\n'.join(input_texts)
-                # if self.use_numpy:
                 balance_loss = 1
-
-                clinical_infor = ''
-                if self.Multi_center in ['KM','CD','SCS']:
-                    clinical_infor = '临床信息: '
-                    excel_id = self.data_list[idx]['Text']['excel_id']
-                    def _safe_get(key):
-                        col = self.G_columns_as_lists.get(key)
-                        if col is None:
-                            return None
-                        try:
-                            return col[excel_id]
-                        except Exception:
-                            return None
-                    B = _safe_get('性别')
-                    if B is not None:
-                        clinical_infor += '性别: ' + str(B)
-                    C = _safe_get('年龄')
-                    if C is not None:
-                        clinical_infor += ' | '+ '年龄: ' + str(C)
-                    if self.Multi_center == 'KM' and self.prompt_mode != 'caption':
-                        A = _safe_get('临床诊断C')
-                        if A is not None:
-                            clinical_infor += ' | '+ '临床信息: '+str(A)
-                    clinical_infor += '\n'
-
+                excel_id = self.data_list[data_idx]['Text']['excel_id']
+                clinical_infor = self._build_clinical_info(excel_id)
+                class_label = 'None'
 
                 if self.prompt_mode == 'caption':
                     tokens, attention_masks, patch_indices, labels, answer, question = self.prepare_inputs_img_text(
-                        vision_tokens, vision_patch_indices, input_texts, self.tokenizer, clinical_infor)
-                    class_label = 'None'
-                elif self.prompt_mode == 'report':
-                    excel_id = self.data_list[idx]['Text']['excel_id']
-                    input_texts_org = None
-                    col = self.G_columns_as_lists.get('Trans_3')
-                    if col is not None:
-                        try:
-                            input_texts_org = col[excel_id]
-                        except Exception:
-                            input_texts_org = None
-                    if input_texts_org is not None:
-                        input_texts_json = json.loads(input_texts_org)
-                        input_texts_4CH = "，".join(input_texts_json["1.心脏结构"])
-                        cardiac_function = input_texts_json.get("2.心脏运动及功能") or input_texts_json.get("2.心脏功能")
-                        input_texts_SAX = "，".join(cardiac_function)
-                        input_texts_LGE = "，".join(input_texts_json["3.延迟强化LGE"])
-                        input_texts_other = "，".join(input_texts_json["4.其他影像所见"])
-                        input_texts = ''
-                        if 'FCH' in self.dataset_name:
-                            input_texts += ('心脏结构: ' + input_texts_4CH)
-                        if 'SAX' in self.dataset_name:
-                            input_texts += ('心脏运动及功能: ' + input_texts_SAX)
-                        if 'LGE' in self.dataset_name:
-                            input_texts += ('延迟强化LGE: ' + input_texts_LGE)
-
-                    tokens, attention_masks, patch_indices, labels, answer, question = self.prepare_inputs_img_text(
-                        vision_tokens, vision_patch_indices, input_texts, self.tokenizer, clinical_infor)
-                    class_label = 'None'
-                elif self.prompt_mode == 'Question_open' or self.prompt_mode == 'Question_close':
-                    question_squeence_list = question_squeence_list*5 + [3]
-                    question_id = 'Question_open'
-                    if self.prompt_mode == 'Question_open':
-                        if self.Multi_center == 'CD':
-                            question_id = random.choice(['Question_open', 'Question_open_R1', 'Question_open', 'Question_open_R1', 'Question_open_no_2', 'Question_open_no_3'])
-                            data_str = self.G_columns_as_lists[question_id][self.data_list[idx]['Text']['excel_id']]
-                        else:
-                            question_id = random.choice(['Question_open', 'Question_open_R1'])
-                            data_str = self.G_columns_as_lists[question_id][self.data_list[idx]['Text']['excel_id']]
-                    else:
-                        question_id =random.choice(['Question_close', 'Question_close_R1'])
-                        data_str = self.G_columns_as_lists[question_id][self.data_list[idx]['Text']['excel_id']]
-
-                    # data_str = G_columns_as_lists['Question_close'][self.data_list[idx]['Text']['excel_id']]
-                    tokens, attention_masks, patch_indices, labels, answer, question = self.prepare_inputs_img_text(
-                        vision_tokens, vision_patch_indices, data_str, self.tokenizer, clinical_infor, question_squeence_list, question_id)
-                    class_label = 'None'
-                elif self.prompt_mode == 'abnormal_close':
-                    input_texts_org = self.G_columns_as_lists['Trans_4'][self.data_list[idx]['Text']['excel_id']]
-                    value = -1
-                    for _ in range(5):
-                        try:
-                            if self.mode == 'train':
-                                chinese_name = random.choice(list(name_mapping.keys()))
-                            else:
-                                chinese_name = self.abnormal_name
-                            english_name = name_mapping[chinese_name]
-                            pattern = r'\s*"{}",\s*"abnormal":\s*(true|false)'.format(chinese_name)
-                            match = re.search(pattern, input_texts_org, re.IGNORECASE)  # 忽略大小写
-
-                            if match:
-                                abnormal_value = match.group(1).lower()  # 获取 true/false
-                                if abnormal_value == 'true':
-                                    value = 1
-                                else:
-                                    value = 0
-                            else:
-                                value = -1
-
-                            if value != -1:
-                                break
-                        except:
-                            pass
-
-
-
-                    try:
-                        onehot_label = torch.LongTensor([0] * 2)
-                        if value == 1:
-                            balance_loss = self.weights_df['weight_abnormal'][english_name]
-                            onehot_label[1] = 1
-                        else:
-                            balance_loss = self.weights_df['weight_normal'][english_name]
-                            onehot_label[0] = 1
-                    except:
-                        print(english_name)
-                    input_text= str(value)
-                    tokens, attention_masks, patch_indices, labels, answer, question = self.prepare_inputs_img_text(
-                        vision_tokens, vision_patch_indices, input_text, self.tokenizer, clinical_infor, abnormal=chinese_name)
-                    class_label = onehot_label
-                elif self.prompt_mode == 'classification':
-                    tokens, attention_masks, patch_indices, labels, answer, question = self.prepare_inputs_img_text(
-                        vision_tokens, vision_patch_indices, '', self.tokenizer, clinical_infor)
-                # ===== 生存分析任务处理 =====
-                elif self.prompt_mode == 'mace':
-                    # 获取MACE状态和随访时间
-                    mace_status = self.data_list[idx]['Text'].get('mace_cls', 0)
-                    survival_time = self.data_list[idx]['Text'].get('mace_time', 0)
-
-                    # 处理NaN值
-                    if pd.isna(survival_time):
-                        survival_time = getattr(self, 'global_median_time', 0)
-
-                    # 构建生存分析标签
-                    survival_label = []
-                    for bin_time in getattr(self, 'global_time_bins', [0]):
-                        if survival_time >= bin_time:
-                            survival_label.append(1.0)
-                        elif mace_status == 1 and survival_time < bin_time:
-                            survival_label.append(0.0)
-                        else:
-                            survival_label.append(1.0)
-
-                    # 构建问题-答案对
-
-                    answer = f"MACE状态: {'阳性' if mace_status == 1 else '阴性'}, 随访时间: {survival_time}天"
-
-                    tokens, attention_masks, patch_indices, labels, answer, question = self.prepare_inputs_img_text(
-                        vision_tokens, vision_patch_indices, answer, self.tokenizer, clinical_infor
+                        vision_tokens, vision_patch_indices, input_texts, self.tokenizer, clinical_infor
                     )
-                    class_label = 'None'
-
-                    # 构建返回字典
-                    # ret = {
-                    #     "input_ids": tokens,
-                    #     "attention_mask": attention_masks,
-                    #     "vision_patch_indices": patch_indices,
-                    #     "labels": labels,
-                    #     "survival_label": torch.FloatTensor(survival_label),
-                    #     "mace_status": mace_status,
-                    #     "survival_time": survival_time,
-                    #     "balance_loss": balance_loss
-                    # }
-
-                ret = {
-                    "input_ids": tokens,
-                    "attention_mask": attention_masks,
-                    "vision_patch_indices": patch_indices,
-                    "labels": labels,
-                    "class_label": class_label,
-                    "balance_loss":balance_loss
-                }
-
-                if sax_vision_org is not None:
-                    if sax_vision_org.size(2)<3 or sax_vision_org.size(0)<2:
-                        if self.prompt_mode == 'classification':
-                            idx = random.randint(0, len(self.valid_idx) - 1)
-                        else:
-                            idx = random.randint(0, len(self.dataset[0]) - 1)
-                        continue
-                    else:
-                        ret['sax_vision_org_0'] = sax_vision_org.bfloat16()
-
-                if fch_vision_org is not None:
-                    ret['fch_vision_org'] = fch_vision_org.bfloat16()
-
-                if lge_vision_org is not None:
-                    ret['lge_vision_org'] = lge_vision_org.bfloat16()
-
-                if self.mode == 'test':
-                    if question is None:
-                        ret['question'] = ''
-                    else:
-                        ret['question'] = question
-                    if answer is None:
-                        ret['text'] = ''
-                    else:
-                        ret['text'] = answer
-                        # print(answer)
-                if self.prompt_mode == 'classification':
-                    onehot_label = torch.LongTensor([0] * self.n_class)
-                    for class_n in valid_class_label:
-                        if self.n_class == 2:
-                            class_ind = CLASSES_CN.index(class_n)
-                            if class_ind == CLASSES_CN.index('Normal'):
-                                onehot_label[0] = 1
-                            else:
-                                onehot_label[1] = 1
-                        else:
-                            class_ind = CLASSES_CN.index(class_n)
-                            onehot_label[class_ind] = 1
-                    if self.n_class == 2 and onehot_label[0] == 1 and onehot_label[1] == 1:
-                        onehot_label[0] = 0
-                    ret['class_label'] = onehot_label
-                    ret['multilabel'] = self.multilabel
-
-                return ret
-            except Exception as e:
-                print(f"Error in __getitem__ at index : {e}")
-                if self.prompt_mode == 'classification':
-                    idx = random.randint(0, len(self.valid_idx) - 1)
-                else:
-                    idx = random.randint(0, len(self.dataset[0]) - 1)
-
-class UniDatasets_tsvlge_ALL3(Dataset):
-    def __init__(self, args, tokenizer, mode="train", dataset_names=['FCH', 'SAX', 'LGE'], prompt_mode='classification',
-                 n_class=9, multilabel=False, use_seg=True, use_numpy = False, use_det = False, Multi_center = 'KM',
-                 abnormal_name= 'LVEDD', Class_cn = CLASSES_CN_3):
-        super(UniDatasets_tsvlge_ALL3, self).__init__()
-        self.tokenizer = tokenizer
-        self.args = args
-        self.mode = mode
-        self.Multi_center = Multi_center
-        self.CLASSES_CN = Class_cn
-        print()
-        if Multi_center == 'KM':
-            with open(args.all_data_path, 'r') as file:
-                self.json_file = json.load(file)
-            self.G_columns_as_lists = G_KM_columns_as_lists
-            self.data_all_root = {
-                'image': args.data_root,
-                'LV_mask': args.seg_Lv_root,
-                'RV_mask': args.seg_Rv_root,
-                'MYO_mask': args.seg_MYO_root,
-                'DET_mask': args.det_km_root,
-            }
-            self.weights_df = calculate_cardiac_weights(KM_excel_path)
-        elif Multi_center == 'SCS':
-            with open(args.scs_data_path, 'r') as file:
-                self.json_file = json.load(file)
-            self.G_columns_as_lists = G_SCS_columns_as_lists
-            self.data_all_root = {
-                'image': args.scs_root,
-                'LV_mask': args.seg_scs_Lv_root,
-                'RV_mask': args.seg_scs_Rv_root,
-                'MYO_mask': args.seg_scs_MYO_root,
-                'DET_mask': args.det_scs_root,
-            }
-            self.weights_df = calculate_cardiac_weights(SCS_excel_path)
-        elif Multi_center == 'CD':
-            with open(args.cd_data_path, 'r') as file:
-                self.json_file = json.load(file)
-            self.G_columns_as_lists = G_CD_columns_as_lists
-            self.data_all_root = {
-                'image': args.cd_root,
-                'LV_mask': args.seg_cd_Lv_root,
-                'RV_mask': args.seg_cd_Rv_root,
-                'MYO_mask': args.seg_cd_MYO_root,
-                'DET_mask': args.det_cd_root,
-            }
-            self.weights_df = calculate_cardiac_weights(CD_excel_path)
-        elif Multi_center == 'NCSD':
-            with open(args.location_data_path3D, 'r') as file:
-                self.json_file = json.load(file)
-            self.data_all_root = {
-                'image': args.data_root,
-                'LV_mask': args.seg_cd_Lv_root,#!
-                'RV_mask': args.seg_cd_Rv_root,
-                'MYO_mask': args.seg_cd_MYO_root,
-            }
-        elif Multi_center == 'YA':
-            with open(args.YA_data_path, 'r') as file:
-                self.json_file = json.load(file)
-                self.json_file['test'] = self.json_file['train']
-            self.G_columns_as_lists = G_YA_columns_as_lists
-            self.data_all_root = {
-                'image': args.YA_root,
-                'LV_mask': args.seg_YA_Lv_root,#!
-                'RV_mask': args.seg_YA_Rv_root,
-                'MYO_mask': args.seg_YA_MYO_root,
-                'DET_mask': args.det_YA_root,
-            }
-        self.data_list = self.json_file[mode]
-        self.dataset = []
-        self.dataset_name = dataset_names
-        self.n_class = n_class
-        print(f'Number class: ' + str(self.n_class))
-        self.multilabel = multilabel
-        self.use_seg = use_seg
-        self.use_numpy = use_numpy
-        self.use_det = use_det
-        for dataset_name in dataset_names:
-            if dataset_name == 'SAX':
-                self.sax_dataset = SAXCineDataset_CMR_3DFilm_vst_ALL(self.args, self.data_all_root, self.tokenizer,
-                                                                 self.json_file, self.G_columns_as_lists, self.mode,
-                                                                 use_seg=self.use_seg, use_numpy = self.use_numpy, use_det =  self.use_det)
-                self.dataset.append(self.sax_dataset)
-            if dataset_name == 'FCH':
-                self.fch_dataset = FCHCineDataset_CMR_2DFilm_vst(self.args, self.data_all_root, self.tokenizer,
-                                                                 self.json_file, self.G_columns_as_lists,self.mode,
-                                                                 use_numpy = self.use_numpy)  # 4CH
-                self.dataset.append(self.fch_dataset)
-            if dataset_name == 'LGE':
-                self.lge_dataset = LGEDataset_CMR_3D_vst(self.args, self.data_all_root, self.tokenizer,
-                                                        self.json_file, self.G_columns_as_lists,self.mode,
-                                                        use_seg=self.use_seg, use_numpy = self.use_numpy, use_det = self.use_det)
-                self.dataset.append(self.lge_dataset)
-
-        self.max_position_embeddings = 4096
-        self.prompt_mode = prompt_mode
-        self.abnormal_name =abnormal_name
-        if self.prompt_mode == 'classification':
-            self.valid_idx = self.filter_class_label_numpy()
-
-    def __len__(self):
-        if self.prompt_mode == 'classification':
-            return len(self.valid_idx)
-        else:
-            return len(self.dataset[0])
-
-
-    def filter_class_label_numpy(self):
-        valid_idx = []
-        for data_index, data in enumerate(self.data_list):
-            excel_id =  data['Text']['excel_id'] #G_columns_as_lists[]
-            valid_class_label = []
-            for class_n in self.CLASSES_CN:
-                try:
-                    if self.G_columns_as_lists[class_n][excel_id] == 1:
-                        valid_class_label.append(class_n)
-                except:
-                    pass
-            if len(valid_class_label) > 0:
-                valid_idx.append(data_index)
-                self.data_list[data_index]['classes'] = valid_class_label[0]
-        print(self.CLASSES_CN)
-        return valid_idx
-
-    def prepare_inputs_img_text(self, input_img_tokens, input_img_patch_indices, input_text,
-                                tokenizer, clinical_infor = '',
-                                question_squeence_list = [3], question_id = 'Question_open', abnormal = ''):
-        end_token = tokenizer.eos_token
-
-        NON_VISION_TOKEN = -1
-        tokens = []
-        attention_masks = []
-        vision_patch_indices = []
-        vision_patches = []
-        labels = []
-
-        # ---
-        img_tokens = ["<vision>"]
-        cur_patch_indices = [NON_VISION_TOKEN]
-
-        update_patch_indices = [cur_index + len(cur_patch_indices) - cur_patch_indices.count(
-            NON_VISION_TOKEN) if cur_index != NON_VISION_TOKEN else NON_VISION_TOKEN for cur_index in
-                                input_img_patch_indices]
-
-        cur_patch_indices = cur_patch_indices + update_patch_indices  # include the whole <vision>...<vision>
-        img_tokens = img_tokens + input_img_tokens  # all datasets should concat this
-
-        img_tokens.append("/<vision>")
-        cur_patch_indices.append(NON_VISION_TOKEN)
-
-
-        # ---
-        # NOTE tokenizer(xxx) will NOT work here
-        cur_tokens = torch.Tensor(tokenizer.convert_tokens_to_ids(img_tokens))
-        cur_attention_mask = [1] * len(cur_tokens)
-
-        assert len(cur_tokens) == len(cur_patch_indices), f"{len(cur_tokens)} != {len(cur_patch_indices)}"
-
-        tokens.extend(cur_tokens)
-        labels.extend([-100] * len(cur_tokens))
-        attention_masks.extend(cur_attention_mask)
-        vision_patch_indices.extend(cur_patch_indices)
-
-        if self.prompt_mode == 'caption':
-            question = clinical_infor + random.choice(caption_prompt)
-            answer = input_text  # text
-            answer = answer + end_token
-        elif self.prompt_mode == 'report':
-            question = clinical_infor + random.choice(report_prompt)
-            answer = input_text  # text
-            answer = answer + end_token
-        elif self.prompt_mode == 'classification':
-            # question = additional_classification_prompt + '\nQuestion: ' + random.choice(classification_prompt) + '\nAnswer: '
-            question = clinical_infor + additional_classification_prompt_larry + "<CLS>"
-            answer = input_text  # text
-            answer = answer + end_token
-        elif self.prompt_mode == 'Question_open':
-            if question_id == 'Question_open_no_2':
-                QA_list = extract_content(input_text, 4)
-            elif question_id == 'Question_open_no_3':
-                QA_list = extract_content(input_text, 5)
-            else:
-                QA_list = extract_content(input_text, random.choice(question_squeence_list))
-
-            try:
-                if QA_list!= None:
-                    QA = random.choice(QA_list)
-                    Q = 'Question: '+ QA['question']
-                    answer = 'Answer: '+QA['answer'] + end_token
-                    few_shot = 0
-                    if few_shot:
-                        question = clinical_infor + random.choice(question_open_prompt) + "(例如，Question: 左心房大小是否在正常范围内？ Answer: 是，左心房未见增大)" + "\n" + Q
-                    else:
-                        question = clinical_infor + random.choice(question_open_prompt)  + "\n" + Q
-            except:
-                return None
-        # elif question_id == 'Question_open_no_2':
-        #     QA_list = extract_content(input_text, 4)
-        #     try:
-        #         if QA_list!= None:
-        #             QA = random.choice(QA_list)
-        #             Q = 'Question: '+ QA['question']
-        #             answer = 'Answer: '+QA['answer'] + end_token
-        #             few_shot = 0
-        #             if few_shot:
-        #                 question = clinical_infor + random.choice(question_open_prompt) + "(例如，Question: 左心房大小是否在正常范围内？ Answer: 是，左心房未见增大)" + "\n" + Q
-        #             else:
-        #                 question = clinical_infor + random.choice(question_open_prompt)  + "\n" + Q
-        #     except:
-        #         return None
-        # elif question_id == 'Question_open_no_3':
-        #     QA_list = extract_content(input_text, 5)
-        #     try:
-        #         if QA_list!= None:
-        #             QA = random.choice(QA_list)
-        #             Q = 'Question: '+ QA['question']
-        #             answer = 'Answer: '+QA['answer'] + end_token
-        #             few_shot = 0
-        #             if few_shot:
-        #                 question = clinical_infor + random.choice(question_open_prompt) + "(例如，Question: 左心房大小是否在正常范围内？ Answer: 是，左心房未见增大)" + "\n" + Q
-        #             else:
-        #                 question = clinical_infor + random.choice(question_open_prompt)  + "\n" + Q
-        #     except:
-        #         return None
-        elif self.prompt_mode == 'Question_close':
-            QA_list = extract_content_close(input_text, random.choice(question_squeence_list))
-            try:
-                if QA_list!= None:
-                    QA = random.choice(QA_list)
-                    Q = f"Question: {QA['question']} \n"
-                    Q += "Options:"
-                    for letter, content in QA['shuffled_options']:
-                        Q+=f"  {letter}. {content}"
-                    answer = f"Answer: {QA['randanswer_letter']}"  + end_token
-                    question = clinical_infor + random.choice(question_close_prompt) + "\n" + Q
-            except:
-                return None
-
-        elif self.prompt_mode == 'abnormal_close':
-            question = r'CMR影像中的“{}”是否存在异常？'.format(abnormal)
-            # question = clinical_infor + random.choice(report_prompt)
-            answer = input_text
-            answer = answer + end_token
-
-        # img_tokens.append("<CLS>")
-        # cur_patch_indices.append(NON_VISION_TOKEN)
-        # if self.prompt_mode == 'caption':
-        c_new = tokenizer.bos_token + f"{B_INST} {question.strip()} {E_INST}"
-        _tokenized = tokenizer(c_new, return_tensors="pt", add_special_tokens=False)
-        cur_tokens = _tokenized["input_ids"].squeeze(0)
-        cur_attention_mask = _tokenized["attention_mask"].squeeze(0)
-        tokens.extend(cur_tokens)
-        labels.extend([-100] * len(cur_tokens))
-        attention_masks.extend(cur_attention_mask)
-        vision_patch_indices.extend([NON_VISION_TOKEN] * len(cur_tokens))
-
-
-        if self.mode == 'train':
-            # 不能给classification任务添加answer token，不然会让模型学到answer text token和实际label的关系
-            if self.prompt_mode == 'classification':
-                # random.shuffle(answer)
-                answer = ''+ end_token #str(answer)
-            # print(answer)
-            _tokenized = tokenizer(answer, return_tensors="pt", add_special_tokens=False)
-            cur_tokens = _tokenized["input_ids"].squeeze(0)
-            cur_attention_mask = _tokenized["attention_mask"].squeeze(0)
-            tokens.extend(cur_tokens)
-            labels.extend(cur_tokens)
-            attention_masks.extend(cur_attention_mask)
-            vision_patch_indices.extend([NON_VISION_TOKEN] * len(cur_tokens))
-
-        if len(tokens) > self.max_position_embeddings:
-            tokens = tokens[:self.max_position_embeddings]
-            labels = labels[:self.max_position_embeddings]
-            attention_masks = attention_masks[:self.max_position_embeddings]
-            vision_patch_indices = vision_patch_indices[:self.max_position_embeddings]
-            vision_patches = vision_patches[:self.max_position_embeddings]
-
-        tokens = torch.Tensor(tokens).long()
-        labels = torch.Tensor(labels).long()
-        attention_masks = torch.Tensor(attention_masks).long()
-
-        vision_patch_indices = torch.Tensor(vision_patch_indices).long()
-        return tokens, attention_masks, vision_patch_indices, labels, answer, question
-
-    def __getitem__(self, idx):
-        max_attempts = 10
-        NON_VISION_TOKEN = -1
-        for _ in range(max_attempts):
-            try:
-                if self.prompt_mode == 'classification':
-                    idx = self.valid_idx[idx]
-                    class_label = [self.data_list[idx]['classes']]
-                    valid_class_label = class_label
-
-                vision_tokens = []
-                vision_patch_indices = []
-                input_texts = []
-                # sax_vision_patches = None
-                # fch_vision_patches = None
-                lge_vision_patches = None
-                sax_vision_org = None
-                fch_vision_org = None
-                lge_vision_org = None
-                vision_flag = False
-                question_squeence_list= []
-                for dataset_ind, dataset in enumerate(self.dataset):
-                    # import pdb;pdb.set_trace()
-                    if self.dataset_name[dataset_ind] == 'SAX':
-                        try:
-                            dataset_item = dataset[idx]
-                            # sax_vision_patches = dataset_item['vision_patches']
-                            sax_vision_org = dataset_item['org_image_list']
-                            if sax_vision_org is None:
-                                continue
-                            else:
-                                vision_sax_flag = True
-                                question_squeence_list.append(1)
-                        except:
-                            sax_vision_org = None
-                            continue
-                    if self.dataset_name[dataset_ind] == 'FCH':
-                        try:
-                            dataset_item = dataset[idx]
-                            # fch_vision_patches = dataset_item['vision_patches']
-                            fch_vision_org = dataset_item['org_image']
-                            if fch_vision_org is None:
-                                continue
-                            else:
-                                vision_fch_flag = True
-                                question_squeence_list.append(0)
-                        except:
-                            fch_vision_org = None
-                            continue
-                    if self.dataset_name[dataset_ind] == 'LGE':
-                        try:
-                            dataset_item = dataset[idx]
-                            lge_vision_org = dataset_item['org_image']
-                            if lge_vision_org is None:
-                                continue
-                            else:
-                                vision_lge_flag = True
-                                question_squeence_list.append(2)
-                        except:
-                            lge_vision_org = None
-                            continue
-
-                    vision_tokens.extend(dataset_item["input_ids"])
-                    update_patch_indices = [cur_index + len(vision_patch_indices) - vision_patch_indices.count(
-                        NON_VISION_TOKEN) if cur_index != NON_VISION_TOKEN else NON_VISION_TOKEN for cur_index in
-                                            dataset_item['vision_patch_indices']]
-                    vision_patch_indices.extend(update_patch_indices)
-                    input_texts.append(dataset_item['text'])
-
-
-                input_texts = '\n'.join(input_texts)
-                # if self.use_numpy:
-                balance_loss = 1
-
-                clinical_infor = ''
-                if self.Multi_center in ['KM','CD','SCS','YA']:
-                    clinical_infor = '临床信息: '
-                    excel_id = self.data_list[idx]['Text']['excel_id']
-                    def _safe_get(key):
-                        col = self.G_columns_as_lists.get(key)
-                        if col is None:
-                            return None
-                        try:
-                            return col[excel_id]
-                        except Exception:
-                            return None
-                    B = _safe_get('性别')
-                    if B is not None:
-                        clinical_infor += '性别: ' + str(B)
-                    C = _safe_get('年龄')
-                    if C is not None:
-                        clinical_infor += ' | '+ '年龄: ' + str(C)
-                    if self.Multi_center == 'KM':
-                        A = _safe_get('临床诊断C')
-                        if A is not None:
-                            clinical_infor += ' | '+ '临床信息: '+str(A)
-                    clinical_infor += '\n'
-
-
-                if self.prompt_mode == 'caption':
-                    tokens, attention_masks, patch_indices, labels, answer, question = self.prepare_inputs_img_text(
-                        vision_tokens, vision_patch_indices, input_texts, self.tokenizer, clinical_infor)
-                    class_label = 'None'
                 elif self.prompt_mode == 'report':
-                    excel_id = self.data_list[idx]['Text']['excel_id']
-                    input_texts_org = None
-                    col = self.G_columns_as_lists.get('Trans_3')
-                    if col is not None:
-                        try:
-                            input_texts_org = col[excel_id]
-                        except Exception:
-                            input_texts_org = None
-                    if input_texts_org is not None:
-                        input_texts_json = json.loads(input_texts_org)
-                        input_texts_4CH = "，".join(input_texts_json["1.心脏结构"])
-                        cardiac_function = input_texts_json.get("2.心脏运动及功能") or input_texts_json.get("2.心脏功能")
-                        input_texts_SAX = "，".join(cardiac_function)
-                        input_texts_LGE = "，".join(input_texts_json["3.延迟强化LGE"])
-                        input_texts_other = "，".join(input_texts_json["4.其他影像所见"])
-                        input_texts = ''
-                        if 'FCH' in self.dataset_name:
-                            input_texts += ('心脏结构: ' + input_texts_4CH)
-                        if 'SAX' in self.dataset_name:
-                            input_texts += ('心脏运动及功能: ' + input_texts_SAX)
-                        if 'LGE' in self.dataset_name:
-                            input_texts += ('延迟强化LGE: ' + input_texts_LGE)
-
+                    report_text = self._build_report_text(excel_id, input_texts)
                     tokens, attention_masks, patch_indices, labels, answer, question = self.prepare_inputs_img_text(
-                        vision_tokens, vision_patch_indices, input_texts, self.tokenizer, clinical_infor)
-                    class_label = 'None'
-                elif self.prompt_mode == 'Question_open' or self.prompt_mode == 'Question_close':
-                    question_squeence_list = question_squeence_list*5 + [3]
-                    question_id = 'Question_open'
-                    if self.prompt_mode == 'Question_open':
-                        if self.Multi_center == 'CD':
-                            question_id = random.choice(['Question_open', 'Question_open_R1', 'Question_open', 'Question_open_R1', 'Question_open_no_2', 'Question_open_no_3'])
-                            data_str = self.G_columns_as_lists[question_id][self.data_list[idx]['Text']['excel_id']]
-                        else:
-                            question_id = random.choice(['Question_open', 'Question_open_R1'])
-                            data_str = self.G_columns_as_lists[question_id][self.data_list[idx]['Text']['excel_id']]
-                    else:
-                        question_id =random.choice(['Question_close', 'Question_close_R1'])
-                        data_str = self.G_columns_as_lists[question_id][self.data_list[idx]['Text']['excel_id']]
-
-                    # data_str = G_columns_as_lists['Question_close'][self.data_list[idx]['Text']['excel_id']]
+                        vision_tokens, vision_patch_indices, report_text, self.tokenizer, clinical_infor
+                    )
+                elif self.prompt_mode in self.QUESTION_PROMPT_MODES:
+                    question_squeence_list = question_squeence_list * 5 + [3]
+                    question_id, data_str = self._sample_question_entry(excel_id, self.prompt_mode)
                     tokens, attention_masks, patch_indices, labels, answer, question = self.prepare_inputs_img_text(
-                        vision_tokens, vision_patch_indices, data_str, self.tokenizer, clinical_infor, question_squeence_list, question_id)
-                    class_label = 'None'
+                        vision_tokens, vision_patch_indices, data_str, self.tokenizer,
+                        clinical_infor, question_squeence_list, question_id
+                    )
                 elif self.prompt_mode == 'abnormal_close':
-                    input_texts_org = self.G_columns_as_lists['Trans_4'][self.data_list[idx]['Text']['excel_id']]
-                    value = -1
-                    for _ in range(5):
-                        try:
-                            if self.mode == 'train':
-                                chinese_name = random.choice(list(name_mapping.keys()))
-                            else:
-                                chinese_name = self.abnormal_name
-                            english_name = name_mapping[chinese_name]
-                            pattern = r'\s*"{}",\s*"abnormal":\s*(true|false)'.format(chinese_name)
-                            match = re.search(pattern, input_texts_org, re.IGNORECASE)  # 忽略大小写
-
-                            if match:
-                                abnormal_value = match.group(1).lower()  # 获取 true/false
-                                if abnormal_value == 'true':
-                                    value = 1
-                                else:
-                                    value = 0
-                            else:
-                                value = -1
-
-                            if value != -1:
-                                break
-                        except:
-                            pass
-
-
-
-                    try:
-                        onehot_label = torch.LongTensor([0] * 2)
-                        if value == 1:
-                            balance_loss = self.weights_df['weight_abnormal'][english_name]
-                            onehot_label[1] = 1
-                        else:
-                            balance_loss = self.weights_df['weight_normal'][english_name]
-                            onehot_label[0] = 1
-                    except:
-                        print(english_name)
-                    input_text= str(value)
-                    tokens, attention_masks, patch_indices, labels, answer, question = self.prepare_inputs_img_text(
-                        vision_tokens, vision_patch_indices, input_text, self.tokenizer, clinical_infor, abnormal=chinese_name)
-                    class_label = onehot_label
+                    (
+                        tokens, attention_masks, patch_indices, labels, answer, question,
+                        class_label, balance_loss
+                    ) = self._build_abnormal_close(excel_id, vision_tokens, vision_patch_indices, clinical_infor)
                 elif self.prompt_mode == 'classification':
                     tokens, attention_masks, patch_indices, labels, answer, question = self.prepare_inputs_img_text(
-                        vision_tokens, vision_patch_indices, '', self.tokenizer, clinical_infor)
+                        vision_tokens, vision_patch_indices, '', self.tokenizer, clinical_infor
+                    )
+                elif self.prompt_mode == 'mace':
+                    tokens, attention_masks, patch_indices, labels, answer, question = self._build_mace_sample(
+                        data_idx, vision_tokens, vision_patch_indices, clinical_infor
+                    )
+                else:
+                    raise ValueError(f"Unsupported prompt_mode: {self.prompt_mode}")
 
                 ret = {
                     "input_ids": tokens,
@@ -7172,77 +6499,74 @@ class UniDatasets_tsvlge_ALL3(Dataset):
                     "vision_patch_indices": patch_indices,
                     "labels": labels,
                     "class_label": class_label,
-                    "balance_loss":balance_loss
+                    "balance_loss": balance_loss,
                 }
 
-                if sax_vision_org is not None:
-                    if sax_vision_org.size(2)<3 or sax_vision_org.size(0)<2:
-                        if self.prompt_mode == 'classification':
-                            idx = random.randint(0, len(self.valid_idx) - 1)
-                        else:
-                            idx = random.randint(0, len(self.dataset[0]) - 1)
-                        continue
-                    else:
-                        ret['sax_vision_org_0'] = sax_vision_org.bfloat16()
-                # if sax_vision_org is not None:
-                #     # ret['sax_vision_patches'] = sax_vision_patches
-                #     if len(sax_vision_org) == 1:
-                #         ret['sax_vision_org_0'] = sax_vision_org[0].bfloat16()
-                #     elif len(sax_vision_org) == 2:
-                #         ret['sax_vision_org_0'] = sax_vision_org[0].bfloat16()
-                #         ret['sax_vision_org_1'] = sax_vision_org[1].bfloat16()
-                #     elif len(sax_vision_org) == 3:
-                #         ret['sax_vision_org_0'] = sax_vision_org[0].bfloat16()
-                #         ret['sax_vision_org_1'] = sax_vision_org[1].bfloat16()
-                #         ret['sax_vision_org_2'] = sax_vision_org[2].bfloat16()
-                #     else:
-                #         pass
-
-
-
-                if fch_vision_org is not None:
-                    ret['fch_vision_org'] = fch_vision_org.bfloat16()
-
-                # if fch_vision_patches is not None:
-                #     ret['fch_vision_patches'] = fch_vision_patches
-                if lge_vision_org is not None:
-                    ret['lge_vision_org'] = lge_vision_org.bfloat16()
-
-
+                if not self._attach_modal_images(ret, org_images):
+                    raise RuntimeError(
+                        f"No usable modal images for idx={data_idx}, center={self.Multi_center}, mode={self.mode}, prompt_mode={self.prompt_mode}"
+                    )
 
                 if self.mode == 'test':
-                    if question is None:
-                        ret['question'] = ''
-                    else:
-                        ret['question'] = question
-                    if answer is None:
-                        ret['text'] = ''
-                    else:
-                        ret['text'] = answer
-                        # print(answer)
+                    ret['question'] = question or ''
+                    ret['text'] = answer or ''
+
                 if self.prompt_mode == 'classification':
-                    onehot_label = torch.LongTensor([0] * self.n_class)
-                    for class_n in valid_class_label:
-                        if self.n_class == 2:
-                            class_ind = self.CLASSES_CN.index(class_n)
-                            if class_ind == self.CLASSES_CN.index('正常'):
-                                onehot_label[0] = 1
-                            else:
-                                onehot_label[1] = 1
-                        else:
-                            class_ind = self.CLASSES_CN.index(class_n)
-                            onehot_label[class_ind] = 1
-                    if self.n_class == 2 and onehot_label[0] == 1 and onehot_label[1] == 1:
-                        onehot_label[0] = 0
-                    ret['class_label'] = onehot_label
+                    ret['class_label'] = self._build_classification_onehot(valid_class_label)
                     ret['multilabel'] = self.multilabel
+
                 return ret
             except Exception as e:
-                print(f"Error in __getitem__ at index : {e}")
-                if self.prompt_mode == 'classification':
-                    idx = random.randint(0, len(self.valid_idx) - 1)
-                else:
-                    idx = random.randint(0, len(self.dataset[0]) - 1)
+                last_error = e
+                if self.mode != 'train':
+                    raise RuntimeError(
+                        f"Failed to build eval sample for original_idx={original_idx}, current_idx={idx}, center={self.Multi_center}, prompt_mode={self.prompt_mode}: {e}"
+                    ) from e
+                idx = self._retry_idx()
+
+        raise RuntimeError(
+            f"Failed to build sample after {max_attempts} attempts for prompt_mode={self.prompt_mode}. "
+            f"Last error: {last_error}"
+        )
+
+
+class UniDatasets_tsvlge_ALL(_UniDatasetsTSVLGBase):
+    pass
+
+class UniDatasets_tsvlge_ALL2(_UniDatasetsTSVLGBase):
+    LGE_DATASET_CLS = LGEDataset_CMR_3D_vst
+    KM_DIAGNOSIS_EXCLUDED_PROMPTS = {'caption'}
+    ENABLE_SECONDARY_CLASSES = True
+    ENABLE_SURVIVAL_PREPROCESS = True
+
+class UniDatasets_tsvlge_ALL3(_UniDatasetsTSVLGBase):
+    LGE_DATASET_CLS = LGEDataset_CMR_3D_vst
+    CLINICAL_INFO_CENTERS = {"KM", "CD", "SCS", "YA"}
+
+    def __init__(self, args, tokenizer, mode="train", dataset_names=['FCH', 'SAX', 'LGE'], prompt_mode='classification',
+                 n_class=9, multilabel=False, use_seg=True, use_numpy=False, use_det=False, Multi_center='KM',
+                 abnormal_name='LVEDD', Class_cn=CLASSES_CN_3):
+        super().__init__(
+            args, tokenizer, mode=mode, dataset_names=dataset_names, prompt_mode=prompt_mode,
+            n_class=n_class, multilabel=multilabel, use_seg=use_seg, use_numpy=use_numpy,
+            use_det=use_det, Multi_center=Multi_center, abnormal_name=abnormal_name, class_names=Class_cn,
+        )
+
+    def extra_center_configs(self):
+        return {
+            'YA': {
+                'json_attr': 'YA_data_path',
+                'columns': G_YA_columns_as_lists,
+                'roots': {
+                    'image': 'YA_root',
+                    'LV_mask': 'seg_YA_Lv_root',
+                    'RV_mask': 'seg_YA_Rv_root',
+                    'MYO_mask': 'seg_YA_MYO_root',
+                    'DET_mask': 'det_YA_root',
+                },
+                'copy_train_to_test': True,
+            },
+        }
 
 class AllDatasets_cls_Seg_vstlge_numpy_evalue(Dataset):
     def __init__(self, args, tokenizer, mode="test"):
@@ -8065,6 +7389,7 @@ class AllDatasets_cls_Seg_vstlge_numpy_Mix(Dataset):
         self.tokenizer = tokenizer
         self.args = args
         self.mode = mode
+        classification_repeat_factor = max(1, int(getattr(self.args, "classification_repeat_factor", 5)))
         dataset_cls_list = []
         dataset_report_list = []
         dataset_QA_list = []
@@ -8128,7 +7453,7 @@ class AllDatasets_cls_Seg_vstlge_numpy_Mix(Dataset):
         # self.dataset_caption = UniDatasets_tsvlge(self.args, self.tokenizer, self.mode, dataset_names=['FCH', 'SAX', 'LGE'],
         #                                prompt_mode='caption', use_seg=True)
         epoch = 1
-        dataset_list = (dataset_cls_list*5+
+        dataset_list = (dataset_cls_list * classification_repeat_factor +
                         dataset_report_list+
                         dataset_caption_list+
                         dataset_QA_list+

@@ -1896,10 +1896,11 @@ class MiniCPM3Model(MiniCPM3PreTrainedModel):
             use_legacy_cache = not isinstance(past_key_values, Cache)
             if use_legacy_cache:
                 past_key_values = DynamicCache.from_legacy_cache(past_key_values)
-        if hasattr(past_key_values, "get_usable_length"):
-            past_key_values_length = past_key_values.get_usable_length(seq_length)
-        else:
-            past_key_values_length = past_key_values.get_seq_length()
+        if past_key_values is not None:
+            if hasattr(past_key_values, "get_usable_length"):
+                past_key_values_length = past_key_values.get_usable_length(seq_length)
+            else:
+                past_key_values_length = past_key_values.get_seq_length()
 
         if position_ids is None:
             device = input_ids.device if input_ids is not None else inputs_embeds.device
@@ -2080,6 +2081,93 @@ class MiniCPM3ForCausalLM(MiniCPM3PreTrainedModel):
         self.DynamicDetectionLoss = DynamicDetectionLoss()
         self.post_init()
 
+    @staticmethod
+    def _ensure_finite(name, tensor):
+        if tensor is None or not torch.is_tensor(tensor):
+            return
+        if torch.isfinite(tensor).all():
+            return
+        raise FloatingPointError(
+            f"Non-finite tensor detected in {name}: "
+            f"nan={torch.isnan(tensor).any().item()} "
+            f"inf={torch.isinf(tensor).any().item()} "
+            f"shape={tuple(tensor.shape)} "
+            f"maxabs={float(torch.nan_to_num(tensor.float()).abs().max())}"
+        )
+
+    def _masked_mean_pool(self, hidden_states, attention_mask=None):
+        if attention_mask is None:
+            return hidden_states.mean(dim=1)
+        mask = attention_mask.to(dtype=hidden_states.dtype, device=hidden_states.device).unsqueeze(-1)
+        denom = mask.sum(dim=1).clamp(min=1.0)
+        return (hidden_states * mask).sum(dim=1) / denom
+
+    def _pool_last_valid_token(self, hidden_states, attention_mask=None):
+        batch_size, seq_len, _ = hidden_states.shape
+        if attention_mask is None:
+            last_indices = torch.full((batch_size,), seq_len - 1, device=hidden_states.device, dtype=torch.long)
+        else:
+            valid_lengths = attention_mask.long().sum(dim=1).clamp(min=1)
+            last_indices = valid_lengths - 1
+        return hidden_states[torch.arange(batch_size, device=hidden_states.device), last_indices]
+
+    def _pool_cls_token(self, hidden_states, input_ids, fallback_attention_mask=None):
+        cls_token_id = getattr(self.config, "classification_cls_token_id", 4)
+        cls_mask = input_ids.eq(cls_token_id)
+        if not cls_mask.any():
+            return self._masked_mean_pool(hidden_states, fallback_attention_mask)
+
+        flipped = torch.flip(cls_mask.long(), dims=[1])
+        last_from_end = flipped.argmax(dim=1)
+        last_indices = cls_mask.size(1) - 1 - last_from_end
+        return hidden_states[torch.arange(hidden_states.size(0), device=hidden_states.device), last_indices]
+
+    def _pool_classification_features(self, hidden_states, input_ids=None, attention_mask=None):
+        pooling_mode = getattr(self.config, "classification_pooling", "mean")
+        if pooling_mode == "cls" and input_ids is not None:
+            return self._pool_cls_token(hidden_states, input_ids, attention_mask)
+        if pooling_mode == "last":
+            return self._pool_last_valid_token(hidden_states, attention_mask)
+        return self._masked_mean_pool(hidden_states, attention_mask)
+
+    def _get_single_label_loss(self):
+        class_weights = getattr(self.config, "classification_class_weights", None)
+        label_smoothing = max(0.0, float(getattr(self.config, "classification_label_smoothing", 0.0)))
+        if class_weights is None:
+            return CrossEntropyLoss(label_smoothing=label_smoothing)
+        weight_tensor = torch.tensor(class_weights, dtype=torch.float32, device=self.lm_head.weight.device)
+        return CrossEntropyLoss(weight=weight_tensor, label_smoothing=label_smoothing)
+
+    def _compute_targeted_pair_margin_loss(self, pooled_logits, class_label, multilabel=False):
+        pair_indices = getattr(self.config, "classification_pair_margin_indices", None)
+        margin_value = float(getattr(self.config, "classification_pair_margin_value", 0.0))
+        margin_weight = float(getattr(self.config, "classification_pair_margin_weight", 0.0))
+
+        if multilabel or pair_indices is None or len(pair_indices) != 2:
+            return None
+        if margin_value <= 0.0 or margin_weight <= 0.0:
+            return None
+        if pooled_logits.dim() != 2 or class_label.dim() != 2:
+            return None
+
+        class_targets = class_label.argmax(dim=-1)
+        pair_idx0, pair_idx1 = int(pair_indices[0]), int(pair_indices[1])
+        pair_mask = (class_targets == pair_idx0) | (class_targets == pair_idx1)
+        if not pair_mask.any():
+            return None
+
+        selected_logits = pooled_logits[pair_mask]
+        selected_targets = class_targets[pair_mask]
+        true_logits = selected_logits[torch.arange(selected_logits.size(0), device=selected_logits.device), selected_targets]
+        other_indices = torch.where(
+            selected_targets == pair_idx0,
+            torch.full_like(selected_targets, pair_idx1),
+            torch.full_like(selected_targets, pair_idx0),
+        )
+        other_logits = selected_logits[torch.arange(selected_logits.size(0), device=selected_logits.device), other_indices]
+        margin_violation = margin_value - (true_logits - other_logits)
+        return torch.relu(margin_violation).mean() * margin_weight
+
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
@@ -2191,6 +2279,7 @@ class MiniCPM3ForCausalLM(MiniCPM3PreTrainedModel):
         
 
         hidden_states = outputs[0]
+        self._ensure_finite("hidden_states", hidden_states)
 
         if self.config.pretraining_tp > 1:
             lm_head_slices = self.lm_head.weight.split(self.vocab_size // self.config.pretraining_tp, dim=0)
@@ -2199,8 +2288,9 @@ class MiniCPM3ForCausalLM(MiniCPM3PreTrainedModel):
         else:
             logits = self.lm_head(hidden_states / (self.config.hidden_size / self.config.dim_model_base))
         logits = logits.float()
+        self._ensure_finite("logits", logits)
 
-        loss = 0
+        loss = None
         loss_text = None
         loss_cls = None
         loss_seg = None
@@ -2210,14 +2300,15 @@ class MiniCPM3ForCausalLM(MiniCPM3PreTrainedModel):
             # Shift so that tokens < n predict n
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            # Flatten the tokens
-            loss_fct = CrossEntropyLoss()
-            shift_logits = shift_logits.view(-1, self.config.vocab_size)
-            shift_labels = shift_labels.view(-1)
-            # Enable model parallelism
-            shift_labels = shift_labels.to(shift_logits.device)
-            loss_text = loss_fct(shift_logits, shift_labels)
-            loss=loss_text
+            valid_token_mask = shift_labels.ne(-100)
+            if valid_token_mask.any():
+                loss_fct = CrossEntropyLoss()
+                shift_logits = shift_logits.view(-1, self.config.vocab_size)
+                shift_labels = shift_labels.view(-1)
+                shift_labels = shift_labels.to(shift_logits.device)
+                loss_text = loss_fct(shift_logits, shift_labels)
+                self._ensure_finite("loss_text", loss_text)
+                loss = loss_text
 
         if class_label == 'None':
             print(class_label)
@@ -2240,7 +2331,11 @@ class MiniCPM3ForCausalLM(MiniCPM3PreTrainedModel):
                     sequence_lengths = -1
 
             # input_cls = hidden_states[torch.arange(batch_size, device=hidden_states.device), sequence_lengths]
-            input_cls = hidden_states[0].mean(dim = 0).squeeze()
+            input_cls = self._pool_classification_features(
+                hidden_states,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            )
 
             # pooled_logits = self.score_cls(input_cls)
 
@@ -2248,6 +2343,8 @@ class MiniCPM3ForCausalLM(MiniCPM3PreTrainedModel):
                 pooled_logits = self.score_cls_binary(input_cls)
             else:
                 pooled_logits = self.score_cls(input_cls)
+            self._ensure_finite("pooled_logits", pooled_logits)
+            pooled_logits_for_loss = pooled_logits.float()
             # if input_ids is not None:
             #     batch_size = input_ids.shape[0]
             # else:
@@ -2260,15 +2357,15 @@ class MiniCPM3ForCausalLM(MiniCPM3PreTrainedModel):
             if len(class_label[0]) == 2:
                 loss_ce = BCELoss()
             elif not multilabel:
-                # print('use cross!')
-                loss_ce = CrossEntropyLoss()
+                loss_ce = self._get_single_label_loss()
             else:
                 loss_ce = BCEWithLogitsLoss()  # 多标签分类损失函数
             # import pdb;pdb.set_trace()
             # print(loss_cls(pooled_logits.squeeze(), class_label.squeeze().float()))
             # print((torch.sigmoid(pooled_logits)> 0.5).long(), class_label)
             # pooled_logits_mean_softmax = F.softmax(pooled_logits, dim=-1)
-            loss_cls = loss_ce(pooled_logits.squeeze(), class_label.squeeze().float())
+            loss_cls = loss_ce(pooled_logits_for_loss.squeeze(), class_label.squeeze().float())
+            self._ensure_finite("loss_cls", loss_cls)
             if len(class_label[0]) == 2:
                 if class_label.squeeze().float()[0] == 1:
                     loss = loss_cls[0] * balance_loss + loss_cls[1] * (1 - balance_loss)
@@ -2276,6 +2373,15 @@ class MiniCPM3ForCausalLM(MiniCPM3PreTrainedModel):
                     loss = loss_cls[1] * balance_loss + loss_cls[0] * (1 - balance_loss)
             else:
                 loss = loss_cls
+
+            pair_margin_loss = self._compute_targeted_pair_margin_loss(
+                pooled_logits_for_loss,
+                class_label.float(),
+                multilabel=multilabel,
+            )
+            if pair_margin_loss is not None:
+                self._ensure_finite("pair_margin_loss", pair_margin_loss)
+                loss = loss + pair_margin_loss
             # print('after:',loss)
 
         if score_lv_button:
@@ -2297,8 +2403,10 @@ class MiniCPM3ForCausalLM(MiniCPM3PreTrainedModel):
                 else:
                     sequence_lengths = -1
             pooled_logits = logits_lv[torch.arange(batch_size, device=logits_lv.device), sequence_lengths]
+            self._ensure_finite("score_lv_logits", pooled_logits)
             loss_fct = torch.nn.L1Loss()#MSELoss()
             loss_score = loss_fct(pooled_logits.squeeze(), score_lv_label.squeeze())
+            self._ensure_finite("loss_score", loss_score)
             loss = loss_score
         if seg_button:
             hidden_states_all = outputs[2]
@@ -2343,6 +2451,7 @@ class MiniCPM3ForCausalLM(MiniCPM3PreTrainedModel):
                 loss_iou = loss_iou.sum()
 
                 loss_seg = loss_dice + loss_bce+ loss_iou
+                self._ensure_finite("loss_seg", loss_seg)
 
                 if self.add_vqaloss:
                     loss += loss_seg
@@ -2358,6 +2467,7 @@ class MiniCPM3ForCausalLM(MiniCPM3PreTrainedModel):
             # criterion = SetCriterion(num_classes, matcher, losses=['labels', 'boxes'])
             outputs_det = self.detect_head(hidden_states)
             loss = self.DynamicDetectionLoss(outputs_det, detection_boxes_class, detection_boxes_bbox)#.sum()
+            self._ensure_finite("loss_det", loss)
             # loss_dict = criterion(outputs_det, target)
             # loss = sum(loss_dict.values())
             self.model.epoch_item += 1
@@ -2375,8 +2485,7 @@ class MiniCPM3ForCausalLM(MiniCPM3PreTrainedModel):
                                     class_names=["LV", "MYO", "RV"])
                 # show_detection(image, outputs_det, detection_boxes_bbox[0])
 
-
-        loss =  loss
+        self._ensure_finite("loss", loss)
         if not return_dict:
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
@@ -2694,11 +2803,17 @@ class MiniCPM3ForCausalLM(MiniCPM3PreTrainedModel):
         input_cls = hidden_states.mean(dim = 1)
         # input_cls = hidden_states[0].mean(dim=0).squeeze()
         # pooled_logits = self.score_cls(input_cls)
+        input_cls = self._pool_classification_features(
+            hidden_states,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        )
 
         if len(class_label[0]) == 2:
             pooled_logits = self.score_cls_binary(input_cls)
         else:
             pooled_logits = self.score_cls(input_cls)
+        pooled_logits_for_loss = pooled_logits.float()
         # if input_ids is not None:
         #     batch_size = input_ids.shape[0]
         # else:
@@ -2718,17 +2833,17 @@ class MiniCPM3ForCausalLM(MiniCPM3PreTrainedModel):
         #
         # pooled_logits = logits_cls[torch.arange(batch_size, device=logits_cls.device), sequence_lengths]
         if len(class_label[0]) == 2:
-            probs = F.softmax(pooled_logits, dim=1)  # 形状为 [batch_size, 2]
+            probs = F.softmax(pooled_logits_for_loss, dim=1)  # 形状为 [batch_size, 2]
             # 选择概率较高的类别作为预测结果
             preds = torch.LongTensor([[0,0]]).to(probs.device)
             preds[:,torch.argmax(probs, dim=1)] = 1  # 形状为 [batch_size]
         elif not multilabel:
-            probs = F.softmax(pooled_logits, dim=1)  # 形状为 [batch_size, 2]
+            probs = F.softmax(pooled_logits_for_loss, dim=1)  # 形状为 [batch_size, 2]
             # 选择概率较高的类别作为预测结果
             preds = torch.LongTensor([[0]*7]).to(probs.device)
             preds[:,torch.argmax(probs, dim=1)] = 1  # 形状为 [batch_size]
         else:
-            probs = torch.sigmoid(pooled_logits)  # 将 logits 转换为概率
+            probs = torch.sigmoid(pooled_logits_for_loss)  # 将 logits 转换为概率
             preds = (probs > 0.5).long()  # 通过阈值 0.5 转换为二进制标签
 
         return preds, pooled_logits
