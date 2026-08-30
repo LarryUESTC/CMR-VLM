@@ -87,7 +87,7 @@ the Docker path above is the tested clean-install route. `demo.py` requires
 
 ## Demo
 
-**Online demo** (no local installation required): http://47.108.84.221:8282/showcase/report
+**Online demo** (no local installation required): http://47.108.84.221:8282/showcase/
 
 A lightweight local check is also available: it performs a text-only forward
 pass with a small configuration.
