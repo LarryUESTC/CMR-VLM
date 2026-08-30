@@ -1,6 +1,6 @@
 # CMR-VLM patch configuration verifier
 
-这个核验包把论文所报告的视觉编码器 patch size 做成可独立重复的检查。它不运行临床推理，也不读取患者数据；只检查模型构造源码和 checkpoint 元数据/权重。
+这个核验包把论文所报告的视觉编码器 patch size 做成可独立重复的检查：只检查模型构造源码和 checkpoint 元数据/权重。
 
 ## 环境
 
@@ -42,8 +42,8 @@ make full-smoke
 ```
 
 该命令使用 `from_pretrained` 读取约 8.36 GB 的模型参数（bf16），检查
-missing、unexpected、mismatched keys，并在小型合成张量上执行三路视觉 encoder。它不读取
-患者数据、不执行临床推理。结果写入 `outputs/full_load_smoke.json`。
+missing、unexpected、mismatched keys，并在小型合成张量上执行三路视觉 encoder。
+结果写入 `outputs/full_load_smoke.json`。
 
 ## 预期结果
 
@@ -51,8 +51,3 @@ missing、unexpected、mismatched keys，并在小型合成张量上执行三路
 - `make verify`：21/21 checks 通过，encoder 三路为
   `(3,4,4)/(3,4,4)/(1,4,4)`、window `(2,7,7)/(2,7,7)/(1,7,7)`；
 - `make full-smoke`：`PASS`，4,177,150,750 参数，0 missing/unexpected/mismatched。
-
-## 边界说明
-
-这些检查只覆盖架构/权重兼容性与最小运行路径；完整病例预处理、训练、端到端报告生成和
-临床指标复现需要未公开的临床数据，不属于本核验包范围。

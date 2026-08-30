@@ -30,8 +30,8 @@ CMR-VLM is a vision–language foundation model designed for multi-sequence 4D c
 
 ### Docker (recommended, clean install with pinned versions)
 
-A verified container image with pinned dependency versions runs all patient-free
-smoke tests. Without the checkpoint mounted it runs the installation check, the
+A verified container image with pinned dependency versions runs the smoke
+tests. Without the checkpoint mounted it runs the installation check, the
 lightweight demo, and the verifier unit tests; with the checkpoint mounted it
 additionally runs the checkpoint-header checks and the strict full checkpoint
 load:
@@ -54,8 +54,7 @@ docker run --rm \
 
 Expected output: `torch.Size([1, 16, 256])` for the demo, `6/6` verifier unit
 tests, `21/21` checkpoint-header checks, and `PASS` with 4,177,150,750
-parameters for the full load. All smoke tests are patient-free and do not
-reproduce clinical performance.
+parameters for the full load.
 
 The minimal pinned dependency set is [requirements-smoke.txt](requirements-smoke.txt);
 the full development-environment export remains in
@@ -88,7 +87,10 @@ the Docker path above is the tested clean-install route. `demo.py` requires
 
 ## Demo
 
-The demo performs a lightweight, text-only forward pass with a small configuration.
+**Online demo** (no local installation required): http://47.108.84.221:8282/showcase/report
+
+A lightweight local check is also available: it performs a text-only forward
+pass with a small configuration.
 
 ```bash
 python demo.py
